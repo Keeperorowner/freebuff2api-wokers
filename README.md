@@ -170,6 +170,54 @@ docker compose up -d --build
 
 > ⚠️ 容器内 `credentials/` 以只读方式挂载；`server.js` 启动时读取并组装 `FREEBUFF_TOKEN`（多账号逗号分隔）。
 
+### ▲ Vercel 部署（推荐备选）
+
+> Vercel 出口是 AWS 美区 IP（`iad1` 东部），**无 Cloudflare 边缘标记**（`cf-worker` / `cf-ray`），服务端看到的像普通云服务器，封号风险低于 CF 部署、略高于自有 VPS 直连。适合作为**备选 / 分流**方案。仓库已包含 `Vercel` 分支的适配层（`api/index.js` + `vercel.json`）。
+
+**方式 A：CLI 部署（从本地上传）**
+
+```bash
+# 1. 安装并登录 Vercel CLI
+npm install -g vercel
+vercel login          # 浏览器打开提示的链接完成授权
+
+# 2. 确保在 Vercel 分支
+git checkout Vercel
+
+# 3. 本地验证构建（可选）
+vercel build --yes
+
+# 4. 部署到生产环境
+vercel --prod --yes
+```
+
+**方式 B：GitHub 集成（推 `Vercel` 分支自动部署）**
+
+1. 把 `Vercel` 分支推送到 GitHub
+2. Vercel 控制台 → Add New Project → Import `freebuff2api-wokers`
+3. 选择 **Vercel** 分支，Framework 选 **Other**
+4. 每次 push `Vercel` 分支会自动部署
+
+**🚨 设置环境变量（两种方式都需要）：**
+
+| 变量 | 说明 |
+|---|---|
+| `FREEBUFF_TOKEN`（必需） | 上游账号 token（可在 `freebuff_tools` 提取） |
+| `FREEBUFF_API_KEY`（可选） | 本 API 访问 key，缺省 `freebuff-default-key` |
+
+CLI 方式设置：
+
+```bash
+echo "<你的token>" | vercel env add FREEBUFF_TOKEN production
+echo "<你的key>"   | vercel env add FREEBUFF_API_KEY production
+# 设置完需重新部署才会生效
+vercel --prod --yes
+```
+
+部署完成后访问 `https://<项目名>.vercel.app`（healthz 验证 / v1/chat/completions 使用）。
+
+> ⚠️ 部署前确认 `.vercelignore` 存在（已排除 `.env`、`credentials/`、`wrangler.toml` 等敏感文件），**不要把真实 token/key 写进代码或配置**。
+
 ### Cloudflare Worker 部署（❌ 不推荐）
 
 > **Freebuff 官方已检测 Cloudflare Worker 部署**（识别 `cf-worker` / `cf-ray` 等边缘标记，源码中已点名类似本项目的代理模式）。在 CF 上部署会显著增加账号被封禁的风险，**不推荐作为主要部署方式**；以下步骤仅保留给熟悉风险的用户参考。

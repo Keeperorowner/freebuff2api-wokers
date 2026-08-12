@@ -1,0 +1,15 @@
+# 敏感文件：绝不部署到 Vercel
+.env
+.env.*
+credentials/
+wrangler.toml
+server.js
+Dockerfile
+docker-compose.yml
+freebuff_tools/
+logs/
+CHANGELOG.md
+.hermes/
+test/
+*.test.mjs
+.MODELS.md
