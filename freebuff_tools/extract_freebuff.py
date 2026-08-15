@@ -33,6 +33,7 @@ GitHub Actions 里的安全行为（重要）：
 import argparse
 import base64
 import json
+from datetime import datetime
 import os
 import secrets
 import sys
@@ -102,7 +103,20 @@ def mask_value(value):
 # HTTP helpers（标准库 urllib，无第三方依赖）
 # ---------------------------------------------------------------------------
 
-def _http(method: str, path: str, body=None, headers=None, query=None, timeout=REQUEST_TIMEOUT):
+def _build_opener(proxy=None):
+    """Return a urllib opener for an optional http/https/socks proxy."""
+    if not proxy:
+        return urllib.request.build_opener()
+    if proxy.startswith(("socks4://", "socks5://")):
+        try:
+            import socks  # noqa: F401
+        except ImportError:
+            raise RuntimeError("SOCKS 代理需要 PySocks: pip install PySocks 后重试")
+    handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
+    return urllib.request.build_opener(handler)
+
+
+def _http(method: str, path: str, body=None, headers=None, query=None, timeout=REQUEST_TIMEOUT, proxy=None):
     url = BASE_URL + path
     if query:
         url += "?" + urllib.parse.urlencode(query)
@@ -119,7 +133,8 @@ def _http(method: str, path: str, body=None, headers=None, query=None, timeout=R
         hdrs.update(headers)
     req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = _build_opener(proxy)
+        with opener.open(req, timeout=timeout) as resp:
             raw = resp.read()
             return resp.status, json.loads(raw) if raw else None, resp.headers
     except urllib.error.HTTPError as e:
@@ -229,7 +244,7 @@ def cmd_login(args):
     fingerprint_id = args.fingerprint or gen_fingerprint()
     print(f"🚀 启动 Freebuff 登录流程（fingerprintId: {fingerprint_id}）...\n")
 
-    status, data, _ = _http("POST", "/api/auth/cli/code", {"fingerprintId": fingerprint_id})
+    status, data, _ = _http("POST", "/api/auth/cli/code", {"fingerprintId": fingerprint_id}, proxy=args.proxy)
     if status != 200 or not data:
         msg = f"❌ 请求登录 URL 失败: HTTP {status} {data}"
         print(msg)
@@ -286,6 +301,7 @@ def cmd_login(args):
                 "fingerprintHash": fingerprint_hash,
                 "expiresAt": expires_at,
             },
+            proxy=args.proxy,
         )
         if status == 200 and data and data.get("user"):
             user = data["user"]
@@ -346,14 +362,14 @@ def cmd_show(_args):
         sys.exit(1)
     print(f"📋 已保存凭证（{len(pairs)} 个账号）:")
     print("-" * 60)
-    for _key, at, email in pairs:
-        verdict, detail = _check_one(at)
+    for _key, at, email, prx in pairs:
+        verdict, detail = _check_one(at, prx)
         print(f"  [{email}] {verdict}")
         print(f"      {at}")
         print(f"      {detail}")
     print("-" * 60)
     print("\n📋 汇总（一行一个，复制进 CF Worker 变量 FREEBUFF_TOKEN）:")
-    for _key, at, _email in pairs:
+    for _key, at, _email, _prx in pairs:
         print(f"   {at}")
     return 0
 
@@ -503,7 +519,7 @@ def _all_tokens():
     """返回 [(key, token, email)]：优先读取 credentials.json 里的全部账号；未配置则用环境变量。"""
     tok = os.environ.get("FREEBUFF_TOKEN")
     if tok:
-        return [("env", tok, "环境变量")]
+        return [("env", tok, "环境变量", "")]
     if CRED_FILE.exists():
         try:
             cred = json.loads(CRED_FILE.read_text())
@@ -511,11 +527,14 @@ def _all_tokens():
             cred = {}
         accts = cred.get("accounts")
         if isinstance(accts, dict) and accts:
-            return [(k, u.get("authToken", ""), u.get("email", "?")) for k, u in accts.items() if u.get("authToken")]
+            return [(k, u.get("authToken", ""), u.get("email", "?"), str(u.get("proxy") or ""))
+                    for k, u in accts.items() if u.get("authToken")]
         if isinstance(cred.get("default"), dict) and cred["default"].get("authToken"):
-            return [("default", cred["default"]["authToken"], cred["default"].get("email", "?"))]
+            return [("default", cred["default"]["authToken"], cred["default"].get("email", "?"),
+                     str(cred["default"].get("proxy") or ""))]
         if cred.get("authToken"):
-            return [("default", cred["authToken"], cred.get("email", "?"))]
+            return [("default", cred["authToken"], cred.get("email", "?"),
+                     str(cred.get("proxy") or ""))]
     return []
 
 
@@ -543,7 +562,7 @@ def _format_quota(rate_limits):
     return "额度 " + "；".join(rows) if rows else "额度未知（快照字段不完整）"
 
 
-def _check_one(tok):
+def _check_one(tok, proxy=None):
     """测活。GET /api/v1/freebuff/session 是 0 消耗探测（不创建 session），
     一次调用同时判定：token 失效 / 被封禁 / 地区受限 / 额度用完 / 存活。
     官方源码 freebuff-session-api.ts 判定：
@@ -558,7 +577,7 @@ def _check_one(tok):
         "x-freebuff-include-unused-rate-limits": "1",
     }
     status, data, _ = _http("GET", "/api/v1/freebuff/session", headers=headers,
-                            timeout=REQUEST_TIMEOUT)
+                            timeout=REQUEST_TIMEOUT, proxy=proxy)
     if status is None:
         return "网络错误", f"请求失败: {data.get('error') if isinstance(data, dict) else data}"
     if status == 401:
@@ -627,7 +646,7 @@ def cmd_export(_args):
     print("# 共 %d 个账号，复制下面的行到 Cloudflare → 变量 → FREEBUFF_TOKEN" % len(pairs))
     print("# 注意：本输出含敏感 token，请勿泄露/提交到 git")
     print("=" * 60)
-    for _key, tok, _email in pairs:
+    for _key, tok, _email, _proxy in pairs:
         print(tok)
     print("=" * 60)
     return 0
@@ -635,12 +654,194 @@ def cmd_export(_args):
 
 # ---------------------------------------------------------------------------
 
+BANNED_EMAILS_FILE = Path(__file__).resolve().parent / "banned_emails.json"
+EXAMPLE_FILE = Path(__file__).resolve().parent / "freebuff_credentials.example.json"
+
+
+def _load_banned_list() -> dict:
+    """读取被封账号名单 {email: {reason, time}}。"""
+    if BANNED_EMAILS_FILE.exists():
+        try:
+            return json.loads(BANNED_EMAILS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_banned_list(lst: dict):
+    BANNED_EMAILS_FILE.write_text(json.dumps(lst, indent=2, ensure_ascii=False))
+    print(f"💀 被封账号名单已更新 → {BANNED_EMAILS_FILE}（{len(lst)} 个）")
+
+
+def _sync_example(removed_emails: set):
+    """把被删除的账号配置从 example 文件里移除（example 与真实凭证保持同步）。"""
+    if not EXAMPLE_FILE.exists():
+        return
+    try:
+        ex = json.loads(EXAMPLE_FILE.read_text())
+    except Exception:
+        return
+    accts = ex.get("accounts")
+    if not isinstance(accts, dict) or not accts:
+        return
+    before = len(accts)
+    to_drop = [k for k, u in accts.items()
+               if (u.get("email") or "") in removed_emails
+               or (str(u.get("id") or "") in removed_emails)]
+    for k in to_drop:
+        accts.pop(k, None)
+    if len(accts) != before:
+        ex["accounts"] = accts
+        EXAMPLE_FILE.write_text(json.dumps(ex, indent=2, ensure_ascii=False))
+        print(f"📝 example 文件已同步：移除 {before - len(accts)} 个被删账号配置 → {EXAMPLE_FILE.name}")
+
+
+def cmd_del(args):
+    """删除被封账号。流程：先像 show 一样展示全部账号状态 → 识别被封账号 → 确认删除
+    → 同步 example 文件 → 生成被封名单 JSON。
+    用法:
+      python3 extract_freebuff.py del              # 先展示全部状态，再自动删除所有 banned
+      python3 extract_freebuff.py del <key>        # 删除指定账号（id / email / token 前缀）
+    """
+    if not CRED_FILE.exists():
+        print("❌ 未找到凭证文件")
+        return 1
+    cred = json.loads(CRED_FILE.read_text())
+    accts = cred.get("accounts")
+    if not isinstance(accts, dict) or not accts:
+        print("❌ 没有可管理的账号（accounts 为空）")
+        return 1
+
+    # ---- 第一步：像 show 一样展示全部账号状态 ----
+    print(f"📋 已保存凭证（{len(accts)} 个账号）:")
+    print("-" * 60)
+    status_map = {}   # key -> (verdict, detail)
+    for k, u in accts.items():
+        tok = u.get("authToken", "") or ""
+        email = u.get("email", "?") or "?"
+        if not tok:
+            status_map[k] = ("无 token ⚠️", "authToken 为空")
+            print(f"  [{email}] 无 token ⚠️")
+            continue
+        verdict, detail = _check_one(tok, u.get("proxy") or "")
+        status_map[k] = (verdict, detail)
+        print(f"  [{email}] {verdict}")
+        print(f"      {detail}")
+    print("-" * 60)
+
+    # ---- 第二步：确定删除目标 ----
+    targets = []
+    if args.key:
+        for k, u in accts.items():
+            tok = u.get("authToken", "") or ""
+            email = u.get("email", "") or ""
+            uid = str(u.get("id", "") or "")
+            if args.key in (k, uid, email) or tok.startswith(args.key):
+                targets.append((k, u))
+        if not targets:
+            print(f"❌ 未找到匹配 {args.key} 的账号")
+            return 1
+    else:
+        # 自动模式：只删「已被封禁」的账号
+        for k, (verdict, _d) in status_map.items():
+            if "已被封禁" in verdict:
+                targets.append((k, accts[k]))
+
+    if not targets:
+        print("✅ 没有检测到被封账号，无需删除")
+        return 0
+
+    print(f"\n🗑️  将删除 {len(targets)} 个账号:")
+    removed_emails = set()
+    for k, u in targets:
+        email = u.get("email", "?") or "?"
+        removed_emails.add(email)
+        print(f"  - {email}（key={k}）")
+    if not args.yes:
+        try:
+            confirm = input("确认删除？[y/N] ")
+        except EOFError:
+            confirm = "n"
+        if confirm.lower() not in ("y", "yes"):
+            print("已取消")
+            return 0
+
+    # ---- 第三步：删除 + 名单 + example 同步 ----
+    banned_list = _load_banned_list()
+    for k, u in targets:
+        email = u.get("email", "?") or "?"
+        uid = str(u.get("id", "") or "")
+        tok = u.get("authToken", "") or ""
+        reason = "banned" if (not args.key and "已被封禁" in status_map.get(k, ("", ""))[0]) else "manual"
+        removed = accts.pop(k, None)
+        if removed is not None:
+            list_key = email if email != "?" else (uid or k)
+            banned_list[list_key] = {
+                "reason": reason,
+                "time": datetime.now().isoformat(timespec="seconds"),
+            }
+            print(f"  ✅ 已删除 {email}（key={k}）")
+        _ = tok  # token 用于 key 匹配，此处不再输出
+
+    cred["accounts"] = accts
+    CRED_FILE.write_text(json.dumps(cred, indent=2, ensure_ascii=False))
+    print(f"💾 凭证已更新 → {CRED_FILE}（剩余 {len(accts)} 个账号）")
+    _save_banned_list(banned_list)
+    _sync_example(removed_emails)
+    return 0
+
+
+
+def cmd_set_proxy(args):
+    """为指定账号设置/清除代理（只改本地凭证，不触碰 Worker）。"""
+    if not CRED_FILE.exists():
+        print("❌ 未找到凭证文件")
+        return 1
+    cred = json.loads(CRED_FILE.read_text())
+    accts = cred.get("accounts")
+    if not isinstance(accts, dict):
+        print("❌ credentials 中没有 accounts 段")
+        return 1
+    matched = []
+    for k, u in accts.items():
+        tok = u.get("authToken", "") or ""
+        email = u.get("email", "") or ""
+        uid = str(u.get("id", "") or "")
+        if args.key in (k, uid, email) or tok.startswith(args.key) or email.startswith(args.key):
+            matched.append((k, u))
+    if not matched:
+        print(f"❌ 未找到匹配 {args.key} 的账号")
+        return 1
+    if len(matched) > 1:
+        print(f"❌ 匹配到多个账号（{len(matched)}），请使用更精确的 id/email 前缀")
+        return 1
+    k, u = matched[0]
+    if args.proxy is None:
+        print(f"当前 {k} 的 proxy: {u.get('proxy') or '(未设置)'}")
+        print("用法：set-proxy <key> 'http://user:pass@host:port'  或传空串清除")
+        return 0
+    u["proxy"] = args.proxy
+    accts[k] = u
+    cred["accounts"] = accts
+    CRED_FILE.write_text(json.dumps(cred, indent=2, ensure_ascii=False))
+    shown = args.proxy if args.proxy else "(已清除)"
+    print(f"✅ {k} proxy 已设置: {shown}")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(description="Freebuff authToken 提取工具")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_login = sub.add_parser("login", help="开始登录（生成 URL + 轮询拿 token）")
     p_login.add_argument("--fingerprint", help="指定 fingerprintId（默认自动生成）")
+    p_login.add_argument("--proxy", default=None,
+                         help="登录/轮询走代理，如 http://user:pass@host:port 或 socks5://host:port（空=直连）")
+
+    p_proxy = sub.add_parser("set-proxy", help="为指定账号设置代理（传空串清除）")
+    p_proxy.add_argument("key", help="账号 id / email / token 前缀")
+    p_proxy.add_argument("proxy", nargs="?", default=None,
+                         help="代理地址；不传则显示当前值，传空串清除")
 
     sub.add_parser("tgsend", help="测试 TG 连通性（发一条测试消息）")
 
@@ -659,8 +860,13 @@ def main():
     sub.add_parser("quota", help="查用量")
 
     sub.add_parser("export", help="汇总全部账号 token，一行一个，复制进 CF Workers 变量")
+    p_del = sub.add_parser("del", help="删除被封账号（自动检测 banned）或指定账号，并生成被封邮箱名单 JSON")
+    p_del.add_argument("key", nargs="?", default=None, help="可选：账号 id / email / authToken 前缀；缺省自动检测并删除所有 banned")
+    p_del.add_argument("--yes", action="store_true", help="跳过确认提示")
 
     args = p.parse_args()
+    if args.cmd == "set-proxy":
+        return cmd_set_proxy(args)
     {
         "login": cmd_login,
         "show": cmd_show,
@@ -669,6 +875,7 @@ def main():
         "quota": cmd_quota,
         "tgsend": cmd_tgsend,
         "export": cmd_export,
+        "del": cmd_del,
     }[args.cmd](args)
 
 

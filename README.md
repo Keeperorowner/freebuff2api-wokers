@@ -431,4 +431,63 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 
 本项目采用 [AGPL-3.0 License](LICENSE)。本项目参考并改写了 [freebuff2api](https://github.com/XxxXTeam/freebuff2api) 的部分代码与结构（原项目为 AGPL-3.0），因此本项目同样以 AGPL-3.0 开源；使用时请保留原版权声明，欢迎自由使用、修改与分享。
 
+---
 
+## 🧪 分支：per-account 代理出口（feat/proxy-accounts）
+
+> 实验性：让 Docker/Node 容器里**每个账号走不同 HTTP/HTTPS/SOCKS5 出口 IP**。
+> Cloudflare Workers 原生不支持自定义出口 IP，此功能只在 **Node 容器/Vercel** 形态生效。
+
+### 启用
+
+```bash
+# 容器环境变量加上：
+FREE_PROXY_ACCOUNTS=1
+```
+
+### 每个账号配代理
+
+`freebuff_tools/freebuff_credentials.json` 每个账号增加可选字段：
+
+```json
+{
+  "accounts": {
+    "账号key": {
+      "id": "...",
+      "email": "...",
+      "authToken": "...",
+      "proxy": "http://user:pass@host:port"
+    }
+  }
+}
+```
+
+- 不填 `proxy` 或留空 = 直连（行为与原来一致）；
+- `http://` / `https://` 代理直接用；
+- `socks5://` 暂未接入（当前提示改用 http/https）。
+
+### 网页面板
+
+容器起来后访问：
+
+```text
+http://容器IP:8877/panel
+```
+
+- 列出全部账号（不显示 token 明文）；
+- 每个账号可直接填/改代理并保存（会写回挂载的 credentials 文件，所以 docker-compose 挂载已去掉 `:ro`）；
+- 代理格式即时校验。
+
+### 本地工具
+
+```bash
+python3 freebuff_tools/extract_freebuff.py set-proxy <账号key> 'http://user:pass@host:port'
+python3 freebuff_tools/extract_freebuff.py set-proxy <账号key> ''   # 清除
+python3 freebuff_tools/extract_freebuff.py login --proxy 'http://user:pass@host:port'  # 登录走代理
+```
+
+### 行为说明
+
+- worker.js 未改动；由 server.js 在运行时按账号 token 匹配代理并注入 undici dispatcher；
+- 开启后直连请求行为不变；`FREE_PROXY_ACCOUNTS` 未设置时与主分支完全一致；
+- 需要 `npm install`（新增 undici 依赖）。
