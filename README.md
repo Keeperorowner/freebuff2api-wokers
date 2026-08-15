@@ -449,7 +449,8 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 | HTTP（无认证） | `http://1.2.3.4:8080` |
 | HTTP（带认证） | `http://user:pass@1.2.3.4:8080` |
 | HTTPS（带认证） | `https://user:pass@1.2.3.4:8080` |
-| SOCKS5 | `socks5://host:port` **（暂未接入，见下）** |
+| SOCKS5（无认证） | `socks5://1.2.3.4:1080` |
+| SOCKS5（带认证） | `socks5://user:pass@1.2.3.4:1080` |
 
 > ⚠️ 建议在**即将部署的这台机器**上先本机验证代理可用，避免把失效代理配上去：
 > ```bash
@@ -554,7 +555,7 @@ curl -x http://user:pass@1.2.3.4:8080 -s --max-time 10 https://api.ip.sb/geoip
 
 ### 五、当前限制
 
-- **SOCKS5 暂未接入**：配 `socks5://` 会提示“先用 http/https 代理测试”。需要 SOCKS5 时，可先用 `privoxy`/`gost` 这类工具把 SOCKS5 转成本地 HTTP 代理再填；
+- **SOCKS5 已支持**：`socks5://...` 和 `socks5://user:pass@...` 均可（实现为 RFC1928 自定义 connect，无需额外依赖）。`socks4`/`socks4a` 格式也能被识别，但优先用 socks5；
 - 只对 **Node 容器 / Vercel** 生效；Cloudflare Workers 无自定义出口 IP 能力，该分支对 Workers 无意义；
 - 实际出口可达性与地区限制（如 freebuff 免费模型限 US）取决于你用的代理 IP 本身；
 - 面板保存会写回挂载文件，若挂载为 `:ro` 会失败（本分支已默认去掉）。

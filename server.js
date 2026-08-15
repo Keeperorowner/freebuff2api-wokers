@@ -2,6 +2,8 @@ import { createServer } from 'node:http';
 import { readFileSync, readdirSync, existsSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import net from 'node:net';
+import tls from 'node:tls';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -72,14 +74,85 @@ let dispatchError = '';
 async function buildProxyDispatch(proxyUrl) {
   try {
     if (!proxyUrl) return null;
-    if (/^(socks4|socks5|socks5h):\/\//i.test(proxyUrl)) {
-      dispatchError = `socks5 出口暂未接入（proxy=${proxyUrl}），先用 http/https 代理测试`;
-      return null;
-    }
     if (!undiciMod) undiciMod = await import('undici');
     if (process.env.FREEBUFF_DEBUG === 'true') console.error(`[proxy] building agent for ${proxyUrl}, undici=${typeof undiciMod.ProxyAgent}`);
-    const agent = new undiciMod.ProxyAgent(proxyUrl);
-    return agent;
+    // HTTP/HTTPS 代理：undici ProxyAgent 原生支持。
+    if (!/^(socks4|socks4a|socks5|socks5h):\/\//i.test(proxyUrl)) {
+      return new undiciMod.ProxyAgent(proxyUrl);
+    }
+    // SOCKS5：自定义 connect 函数建隧道（RFC1928 握手），再交给 undici Agent。
+    const proxy = new URL(proxyUrl);
+    const socksHost = proxy.hostname || '127.0.0.1';
+    const socksPort = parseInt(proxy.port, 10) || 1080;
+    const socksUser = proxy.username ? decodeURIComponent(proxy.username) : '';
+    const socksPass = proxy.password ? decodeURIComponent(proxy.password) : '';
+    const connectViaSocks = (opts, callback) => {
+      const target = { host: opts.hostname, port: parseInt(opts.port, 10) || 443 };
+      const sock = net.connect(socksPort, socksHost);
+      let done = false;
+      const finish = (err, socket) => {
+        if (done) return;
+        done = true;
+        if (err) { try { sock.destroy(); } catch {} callback(err); }
+        else callback(null, socket);
+      };
+      sock.once('error', (e) => finish(e));
+      sock.once('connect', () => {
+        // greeting：认证方式 = 0x00 无认证 / 0x02 用户名密码
+        if (socksUser) sock.write(Buffer.from([0x05, 0x01, 0x02]));
+        else sock.write(Buffer.from([0x05, 0x01, 0x00]));
+      });
+      let buf = Buffer.alloc(0);
+      let state = 'greet';
+      sock.on('data', (d) => {
+        buf = Buffer.concat([buf, d]);
+        if (state === 'greet') {
+          if (buf.length < 2) return;
+          const method = buf[1];
+          buf = buf.slice(2);
+          if (method === 0xff) return finish(new Error('socks: 代理需要认证，但未提供用户名/密码'));
+          if (method === 0x02) {
+            state = 'auth';
+            if (socksUser.length > 255 || socksPass.length > 255) return finish(new Error('socks: 用户名/密码过长'));
+            const u = Buffer.from(socksUser, 'utf8');
+            const p = Buffer.from(socksPass, 'utf8');
+            sock.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]));
+            return;
+          }
+          state = 'request';
+          sendConnectRequest();
+        } else if (state === 'auth') {
+          if (buf.length < 2) return;
+          if (buf[1] !== 0x00) return finish(new Error('socks: 代理拒绝用户名/密码认证'));
+          buf = buf.slice(2);
+          state = 'request';
+          sendConnectRequest();
+        } else if (state === 'request') {
+          if (buf.length < 10) return;
+          const rep = buf[1];
+          if (rep !== 0x00) return finish(new Error(`socks: 连接失败 rep=${rep}`));
+          buf = buf.slice(10);
+          state = 'done';
+          if (opts.protocol === 'https:') {
+            const t = tls.connect({ socket: sock, servername: opts.servername || target.host });
+            t.once('secureConnect', () => finish(null, t));
+            t.once('error', (e) => finish(e));
+          } else {
+            finish(null, sock);
+          }
+        }
+      });
+      function sendConnectRequest() {
+        const hostBuf = Buffer.from(target.host, 'utf8');
+        const portBuf = Buffer.from([(target.port >> 8) & 0xff, target.port & 0xff]);
+        sock.write(Buffer.concat([
+          Buffer.from([0x05, 0x01, 0x00, 0x03, hostBuf.length]),
+          hostBuf,
+          portBuf,
+        ]));
+      }
+    };
+    return new undiciMod.Agent({ connect: connectViaSocks });
   } catch (e) {
     dispatchError = `proxy agent 构建失败: ${e.message}`;
     return null;
@@ -133,7 +206,7 @@ function verifyProxy(proxyUrl) {
   try {
     if (!proxyUrl) return { ok: true, detail: '未设置（直连）' };
     const u = new URL(proxyUrl);
-    if (!/^https?:$/i.test(u.protocol) && !/^socks5?:$/i.test(u.protocol)) {
+    if (!/^https?:$/i.test(u.protocol) && !/^socks(4|4a|5|5h)?:$/i.test(u.protocol)) {
       return { ok: false, detail: `不支持的协议 ${u.protocol}` };
     }
     return { ok: true, detail: `${u.protocol}//${u.host}` };

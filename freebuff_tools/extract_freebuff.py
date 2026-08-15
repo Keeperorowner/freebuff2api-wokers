@@ -104,14 +104,22 @@ def mask_value(value):
 # ---------------------------------------------------------------------------
 
 def _build_opener(proxy=None):
-    """Return a urllib opener for an optional http/https/socks proxy."""
+    """Return a urllib opener. http/https 用 ProxyHandler；socks 用 PySocks 的 SocksiPyHandler。"""
     if not proxy:
         return urllib.request.build_opener()
-    if proxy.startswith(("socks4://", "socks5://")):
+    if proxy.startswith(("socks4://", "socks4a://", "socks5://", "socks5h://")):
         try:
-            import socks  # noqa: F401
+            import socks
+            import sockshandler
         except ImportError:
             raise RuntimeError("SOCKS 代理需要 PySocks: pip install PySocks 后重试")
+        u = urllib.parse.urlparse(proxy)
+        ptype = socks.PROXY_TYPE_SOCKS5 if u.scheme.startswith("socks5") else socks.PROXY_TYPE_SOCKS4
+        handler = sockshandler.SocksiPyHandler(
+            ptype, u.hostname or "", u.port or 1080,
+            username=u.username or None, password=u.password or None,
+        )
+        return urllib.request.build_opener(handler)
     handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
     return urllib.request.build_opener(handler)
 
