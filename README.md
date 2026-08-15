@@ -435,59 +435,126 @@ Worker 已自动处理以上全部生命周期，无需手动干预。另：syst
 
 ## 🧪 分支：per-account 代理出口（feat/proxy-accounts）
 
-> 实验性：让 Docker/Node 容器里**每个账号走不同 HTTP/HTTPS/SOCKS5 出口 IP**。
+> 实验性：让 Docker/Node 容器里**每个账号走不同 HTTP/HTTPS 出口 IP**（不同国家/住宅 IP 隔离账号）。
 > Cloudflare Workers 原生不支持自定义出口 IP，此功能只在 **Node 容器/Vercel** 形态生效。
 
-### 启用
+---
 
-```bash
-# 容器环境变量加上：
-FREE_PROXY_ACCOUNTS=1
-```
+### 一、先准备代理
 
-### 每个账号配代理
+每个 Freebuff 账号单独一个代理地址（来源随意：住宅代理商、机房小鸡自建、SOCKS5 转 HTTP 等），格式：
 
-`freebuff_tools/freebuff_credentials.json` 每个账号增加可选字段：
+| 类型 | 格式示例 |
+|------|---------|
+| HTTP（无认证） | `http://1.2.3.4:8080` |
+| HTTP（带认证） | `http://user:pass@1.2.3.4:8080` |
+| HTTPS（带认证） | `https://user:pass@1.2.3.4:8080` |
+| SOCKS5 | `socks5://host:port` **（暂未接入，见下）** |
+
+> ⚠️ 建议在**即将部署的这台机器**上先本机验证代理可用，避免把失效代理配上去：
+> ```bash
+> curl -x http://user:pass@1.2.3.4:8080 -s --max-time 10 https://www.codebuff.com/api/v1/ads -o /dev/null -w '%{http_code}\n'
+> # 输出 200 ≈ 代理可用
+> ```
+
+---
+
+### 二、给账号配代理（二选一）
+
+#### 方式 A：直接把 proxy 写进凭证文件
+
+编辑 `freebuff_tools/freebuff_credentials.json`（本地，gitignore 不入库）：
 
 ```json
 {
   "accounts": {
-    "账号key": {
+    "账号key-1": {
       "id": "...",
       "email": "...",
       "authToken": "...",
-      "proxy": "http://user:pass@host:port"
+      "proxy": "http://user:pass@1.2.3.4:8080"
+    },
+    "账号key-2": {
+      "id": "...",
+      "email": "...",
+      "authToken": "...",
+      "proxy": ""
     }
   }
 }
 ```
 
-- 不填 `proxy` 或留空 = 直连（行为与原来一致）；
-- `http://` / `https://` 代理直接用；
-- `socks5://` 暂未接入（当前提示改用 http/https）。
+- `proxy` 留空 / 不写 = 直连；
+- 改完重启容器，或随时可在面板里改（见下）。
 
-### 网页面板
+#### 方式 B：命令行工具
 
-容器起来后访问：
+```bash
+cd freebuff_tools
+python3 extract_freebuff.py set-proxy <账号key> 'http://user:pass@1.2.3.4:8080'
+python3 extract_freebuff.py set-proxy <账号key> ''          # 清除（回直连）
+python3 extract_freebuff.py set-proxy <账号key>             # 只看当前值
+```
+
+#### 方式 C：面板（Docker 运行后）
 
 ```text
 http://容器IP:8877/panel
 ```
 
-- 列出全部账号（不显示 token 明文）；
-- 每个账号可直接填/改代理并保存（会写回挂载的 credentials 文件，所以 docker-compose 挂载已去掉 `:ro`）；
-- 代理格式即时校验。
+| 操作 | 说明 |
+|------|------|
+| 查看 | 表格列出全部账号，显示当前 proxy 与格式校验结果 |
+| 修改 | 输入框改代理 → 点 **保存** → 立即写回挂载的凭证文件 |
+| 校验 | 非法协议（如 `ftp://`）直接报错不保存 |
 
-### 本地工具
+---
+
+### 三、启动容器
 
 ```bash
-python3 freebuff_tools/extract_freebuff.py set-proxy <账号key> 'http://user:pass@host:port'
-python3 freebuff_tools/extract_freebuff.py set-proxy <账号key> ''   # 清除
-python3 freebuff_tools/extract_freebuff.py login --proxy 'http://user:pass@host:port'  # 登录走代理
+# 关键环境变量：开启按账号代理
+FREE_PROXY_ACCOUNTS=1
 ```
 
-### 行为说明
+compose 里加：
 
-- worker.js 未改动；由 server.js 在运行时按账号 token 匹配代理并注入 undici dispatcher；
-- 开启后直连请求行为不变；`FREE_PROXY_ACCOUNTS` 未设置时与主分支完全一致；
-- 需要 `npm install`（新增 undici 依赖）。
+```yaml
+    environment:
+      - FREE_PROXY_ACCOUNTS=1
+```
+
+> ⚠️ 凭证挂载必须可写（面板保存代理要用），分支的 `docker-compose.yml` 已去掉 `:ro`。
+
+---
+
+### 四、验证是否真的走了代理
+
+容器日志：
+
+```bash
+docker logs -f <容器名> | grep '\[proxy\]'
+```
+
+开启 `FREEBUFF_DEBUG=true` 时每次上游请求会打印：
+
+```text
+[proxy] url=https://www.codebuff.com/... auth=tok-xxxx proxy=(direct)        ← 直连
+[proxy] url=https://www.codebuff.com/... auth=tok-xxxx proxy=http://1.2.3.4:8080  ← 走代理
+```
+
+或直接用代理测试账号发一条消息，看出口 IP：
+
+```bash
+curl -x http://user:pass@1.2.3.4:8080 -s --max-time 10 https://api.ip.sb/geoip
+# 输出的 IP 应与该账号代理 IP 一致
+```
+
+---
+
+### 五、当前限制
+
+- **SOCKS5 暂未接入**：配 `socks5://` 会提示“先用 http/https 代理测试”。需要 SOCKS5 时，可先用 `privoxy`/`gost` 这类工具把 SOCKS5 转成本地 HTTP 代理再填；
+- 只对 **Node 容器 / Vercel** 生效；Cloudflare Workers 无自定义出口 IP 能力，该分支对 Workers 无意义；
+- 实际出口可达性与地区限制（如 freebuff 免费模型限 US）取决于你用的代理 IP 本身；
+- 面板保存会写回挂载文件，若挂载为 `:ro` 会失败（本分支已默认去掉）。
