@@ -401,6 +401,7 @@ export default {
     if (url.pathname === "/admin" || url.pathname === "/admin/") return handleAdminPage(request, url);
     if (url.pathname === "/admin/api/state") return handleAdminState(request, env, url);
     if (url.pathname === "/admin/api/delay") return handleAdminDelay(request, env, url);
+    if (url.pathname === "/admin/api/settings") return handleAdminSettings(request, env, url);
 
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
@@ -563,6 +564,19 @@ function summarizeAccountHealth(pool, health) {
 const adminStats = { startedAt: Date.now(), totalRequests: 0, totalErrors: 0, lastRequestAt: null };
 const accountStats = new Map(); // token -> { requests, errors, lastUsedAt }
 
+// 请求日志环形缓冲（仅内存，重启清空；不落盘避免写盘放大）
+const adminLogs = [];
+const ADMIN_LOG_MAX = 200;
+function noteLog(entry) {
+  adminLogs.push(entry);
+  if (adminLogs.length > ADMIN_LOG_MAX) adminLogs.shift();
+}
+function accountLabel(env, token) {
+  if (!token) return "—";
+  const acct = parseAccounts(env).find((a) => a.token === token);
+  return acct && acct.email ? acct.email : token.slice(0, 8) + "...";
+}
+
 function noteRequest() {
   adminStats.totalRequests++;
   adminStats.lastRequestAt = new Date().toISOString();
@@ -678,8 +692,30 @@ async function handleAdminState(request, env, url) {
       regions,
     },
     stats: { ...adminStats, accountsTracked: accountStats.size },
+    settings: RT.settings,
+    logs: adminLogs.slice(-ADMIN_LOG_MAX).reverse(),
     accounts,
   }, 200);
+}
+
+// 设置读写：GET 返回当前设置；POST {accountStrategy} 运行时切换。
+// 持久化：server.js 注入 __freebuffSettingsWriter（写 settings.json），
+// 下次启动经 ADMIN_SETTINGS env 恢复；CF Workers 无写入器 = 仅内存。
+async function handleAdminSettings(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  if (request.method === "POST") {
+    let body = {};
+    try { body = await request.json(); } catch {}
+    const strat = String(body.accountStrategy || "");
+    if (strat === "sequential" || strat === "round-robin") {
+      RT.settings = { ...RT.settings, accountStrategy: strat };
+      const writer = globalThis.__freebuffSettingsWriter;
+      if (writer) { try { writer(JSON.stringify(RT.settings)); } catch {} }
+      return jsonResponse({ ok: true, settings: RT.settings, persisted: !!writer }, 200);
+    }
+    return jsonResponse({ error: { message: "invalid accountStrategy (round-robin | sequential)" } }, 400);
+  }
+  return jsonResponse({ settings: RT.settings }, 200);
 }
 
 function handleAdminPage(request, url) {
@@ -760,6 +796,17 @@ function pickToken(env, sessionModel) {
       if (isUsableSession(cached)) {
         return acct;
       }
+    }
+  }
+
+  // 顺序优先（sequential）：不轮询。始终用列表中第一个可用号，直到它
+  // 额度耗尽/冷却/失效才前进到下一个。配合「每号同时仅一个会话」的
+  // upstream 约束（sessCache 按 token+model 单条缓存），行为最贴近单个
+  // 真实用户顺序用号。
+  if (RT.settings.accountStrategy === "sequential") {
+    for (const acct of finalPool) {
+      const t = acct.token;
+      if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
     }
   }
 
@@ -1310,17 +1357,35 @@ const REGION_META = {
 // （gen-mihomo-config.mjs 按「订阅里真实存在的节点」收敛后写回）
 const DEFAULT_REGIONS = "US,CA,UK,AU,NZ,NO,SE,NL,DK,DE,FR,IT,ES,PT,FI,BE,LU,LI,CH,AT,SG,MT,IL,IE,IS";
 
-let RT = { proxyEnabled: false, proxyHost: "", portBase: 24001, regions: [], adminKey: "" };
+let RT = {
+  proxyEnabled: false, proxyHost: "", portBase: 24001, regions: [], adminKey: "",
+  // settings 可经 /admin/api/settings 运行时修改；server.js 注入持久化副本
+  settings: { accountStrategy: "round-robin" }, // round-robin | sequential
+};
+let rtSettingsInit = false; // env 默认只在首次初始化生效；运行时改动（POST /admin/api/settings）跨请求保留
 function updateRuntimeConfig(env) {
   const regions = String(env.PROXY_REGIONS || DEFAULT_REGIONS)
     .split(",").map((s) => s.trim().toUpperCase()).filter((c) => REGION_META[c]);
   const enableFlag = String(env.PROXY_ENABLED || "").trim().toLowerCase();
+  let settings = RT.settings || { accountStrategy: "round-robin" };
+  if (!rtSettingsInit) {
+    rtSettingsInit = true;
+    if (env.ADMIN_SETTINGS) {
+      try {
+        const s = JSON.parse(env.ADMIN_SETTINGS);
+        if (s && (s.accountStrategy === "sequential" || s.accountStrategy === "round-robin")) {
+          settings = { ...settings, accountStrategy: s.accountStrategy };
+        }
+      } catch {}
+    }
+  }
   RT = {
     proxyEnabled: enableFlag === "1" || enableFlag === "true",
     proxyHost: String(env.PROXY_HOST || "mihomo"),
     portBase: parseInt(env.PROXY_PORT_BASE || "24001", 10) || 24001,
     regions,
     adminKey: String(env.ADMIN_KEY || ""),
+    settings,
   };
 }
 
@@ -1834,6 +1899,12 @@ function responsesInputToMessages(input, instructions) {
 // 这是 reviewer-only 入口：创建 root run 作为父链，再创建 code-reviewer 子 run，
 // 不执行普通 root chat，也不把 reviewer agent 混入普通模型路由。
 async function executeCodeReview(env, chatParams, mc, isStream, mode) {
+  noteRequest();
+  const t0 = Date.now();
+  const emitLog = (status, tok, err, stream) => noteLog({
+    ts: Date.now(), model: mc.id, account: accountLabel(env, tok),
+    status, ms: Date.now() - t0, stream: !!stream, err: err || null,
+  });
   const debug = env.FREEBUFF_DEBUG === "true";
   const reviewerAgent = mc.reviewer_agent;
   const reviewerModel = mc.upstream;
@@ -1903,6 +1974,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         const { readable, writable } = new TransformStream();
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalize);
         else pipeUpstreamToClient(resp.body, writable, finalize);
+        emitLog(200, token, null, true);
         return new Response(readable, {
           status: 200,
           headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
@@ -1913,12 +1985,14 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         ? await responsesToNonStream(resp.body, mc)
         : await streamToNonStream(resp.body, reviewerModel);
       await finalize();
+      emitLog(200, token);
       return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
     } catch (e) {
       console.error("[code_review]", e);
       noteAccountError(token);
       // 官方下线模型：全局失败，立即返回，不换号。
       if (e instanceof ModelUnavailableError) {
+        emitLog(400, token, "model unavailable: " + e.modelId);
         return jsonResponse({ error: { message: "Model not available upstream: " + e.modelId + "（官方已下线/暂停该模型）", type: "unsupported_model" } }, 400);
       }
       lastErrMsg = String(e.message || e);
@@ -1927,6 +2001,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
     }
   }
+  emitLog(502, null, lastErrMsg || "code reviewer failed");
   return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
 }
 
@@ -1934,6 +2009,11 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
 async function executeChat(env, chatParams, mc, isStream, mode) {
   if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
   noteRequest();
+  const t0 = Date.now();
+  const emitLog = (status, tok, err, stream) => noteLog({
+    ts: Date.now(), model: mc.id, account: accountLabel(env, tok),
+    status, ms: Date.now() - t0, stream: !!stream, err: err || null,
+  });
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
@@ -2036,12 +2116,14 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         const { readable, writable } = new TransformStream();
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
         else pipeUpstreamToClient(resp.body, writable);
+        emitLog(200, token, null, true);
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
+      if (mode === "responses") { emitLog(200, token); return jsonResponse(await responsesToNonStream(resp.body, mc), 200); }
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
+      emitLog(200, token);
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
@@ -2049,6 +2131,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       const msg = String(e.message || e);
       // 官方下线模型：全局失败，立即向客户端返回明确错误，不换号、不计冷却。
       if (e instanceof ModelUnavailableError) {
+        emitLog(400, token, "model unavailable: " + e.modelId);
         return jsonResponse({ error: { message: "Model not available upstream: " + e.modelId + "（官方已下线/暂停该模型）", type: "unsupported_model" } }, 400);
       }
       // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
@@ -2069,6 +2152,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
     }
   }
+  emitLog(502, null, lastErrMsg || "all accounts failed");
   return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
 }
 
@@ -2748,22 +2832,73 @@ const ADMIN_HTML = `<!doctype html>
   .zap:hover { border-color:var(--accent); background:rgba(79,140,255,.12); }
   .zap.busy { color:var(--warn); border-color:var(--warn); animation:pulse 1s infinite; }
   @keyframes pulse { 50% { opacity:.5; } }
+  html[data-theme="light"] { --bg:#f3f5f9; --card:#ffffff; --border:#dde3ec; --text:#1c2330; --dim:#68717f; --accent:#2f6fe4; }
+  @media (prefers-color-scheme: light) { html[data-theme="system"] { --bg:#f3f5f9; --card:#ffffff; --border:#dde3ec; --text:#1c2330; --dim:#68717f; --accent:#2f6fe4; } }
+  .hrow { display:flex; align-items:center; justify-content:space-between; }
+  .gear { font-size:16px; line-height:1; padding:6px 12px; color:var(--dim); background:transparent; border:1px solid var(--border); border-radius:8px; cursor:pointer; }
+  .gear:hover { color:var(--text); border-color:var(--dim); }
+  .popover { display:none; position:fixed; top:64px; right:24px; width:280px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; box-shadow:0 8px 28px rgba(0,0,0,.35); z-index:10; }
+  .popover.open { display:block; }
+  .pop-title { font-size:12px; color:var(--dim); margin:6px 0 8px; text-transform:uppercase; letter-spacing:.08em; }
+  .seg { display:flex; gap:6px; }
+  .seg button { flex:1; padding:6px 0; font:inherit; font-size:12px; color:var(--dim); background:transparent; border:1px solid var(--border); border-radius:8px; cursor:pointer; }
+  .seg button:hover { color:var(--text); }
+  .seg button.active { color:var(--accent); border-color:var(--accent); background:rgba(79,140,255,.10); }
+  .pop-note { font-size:12px; color:var(--dim); margin-top:10px; line-height:1.5; }
+  .log-note { font-size:12px; color:var(--dim); }
+  .logs { background:var(--card); border:1px solid var(--border); border-radius:12px; overflow:hidden; }
+  .logrow { display:grid; grid-template-columns:66px 44px 1fr 150px 70px 34px; gap:8px; padding:7px 14px; font-size:12px; border-bottom:1px solid var(--border); align-items:center; }
+  .logrow:last-child { border-bottom:none; }
+  .logrow .l-time { color:var(--dim); font-variant-numeric:tabular-nums; }
+  .logrow .l-model { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .logrow .l-acct { color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .logrow .l-ms { text-align:right; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .logrow .l-tag { text-align:center; color:var(--dim); font-size:11px; }
+  .l-status { text-align:center; border-radius:6px; font-weight:600; }
+  .l-s2 { color:var(--ok); } .l-s4 { color:var(--warn); } .l-s5 { color:var(--err); }
+  .logs-empty { padding:18px; text-align:center; color:var(--dim); font-size:13px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>freebuff2api admin</h1>
+  <div class="hrow"><h1>freebuff2api admin</h1><button class="gear" id="gearBtn" title="设置">⚙</button></div>
   <div class="sub" id="sub">加载中…</div>
   <div class="summary" id="summary"></div>
   <div id="warn"></div>
 </header>
+<div class="popover" id="settingsPop">
+  <div class="pop-title">主题</div>
+  <div class="seg" id="themeSeg">
+    <button data-theme-set="light">浅色</button>
+    <button data-theme-set="dark">深色</button>
+    <button data-theme-set="system">系统</button>
+  </div>
+  <div class="pop-title">账号策略</div>
+  <div class="seg" id="stratSeg">
+    <button data-strat="round-robin">轮询</button>
+    <button data-strat="sequential">顺序优先</button>
+  </div>
+  <div class="pop-note">顺序优先：始终用一个号，额度用完自动换下一个；每号同时仅一个会话</div>
+</div>
 <div class="toast" id="toast"></div>
 <div class="sec-head"><h2>出口区域</h2><button class="zap" id="testall" title="全部区域测速">⚡</button></div>
 <div class="cards" id="regions"></div>
 <h2>账号</h2>
 <div class="cards" id="accounts"></div>
+<div class="sec-head"><h2>请求日志</h2><span class="log-note" id="logNote"></span></div>
+<div class="logs" id="logs"></div>
 <script>
 var KEY = new URLSearchParams(location.search).get('key') || '';
+// ---- 主题：浅色/深色/系统（localStorage 持久化）----
+var THEME_KEY = 'fb2a-theme';
+function applyTheme(t) {
+  if (t !== 'light' && t !== 'dark' && t !== 'system') t = 'system';
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+  var btns = document.querySelectorAll('button[data-theme-set]');
+  btns.forEach(function(b) { b.classList.toggle('active', b.dataset.themeSet === t); });
+}
+applyTheme((function() { try { return localStorage.getItem(THEME_KEY) || 'system'; } catch (e) { return 'system'; } })());
 function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 function ago(ts) {
   if (!ts) return '从未';
@@ -2836,6 +2971,29 @@ function render(d) {
       + '</div>';
   }).join('');
   document.getElementById('accounts').innerHTML = ac;
+  // 请求日志（最新在前）
+  var logs = d.logs || [];
+  document.getElementById('logNote').textContent = logs.length ? ('最近 ' + logs.length + ' 条') : '';
+  document.getElementById('logs').innerHTML = logs.length
+    ? logs.map(function(l) {
+        var sc = l.status >= 500 ? 'l-s5' : (l.status >= 400 ? 'l-s4' : 'l-s2');
+        var t = new Date(l.ts);
+        var hh = ('0'+t.getHours()).slice(-2), mm = ('0'+t.getMinutes()).slice(-2), ss = ('0'+t.getSeconds()).slice(-2);
+        var dur = l.ms != null ? (l.ms < 1000 ? l.ms + 'ms' : (l.ms/1000).toFixed(1) + 's') : '—';
+        return '<div class="logrow" title="' + esc(l.err || '') + '">'
+          + '<span class="l-time">' + hh + ':' + mm + ':' + ss + '</span>'
+          + '<span class="l-status ' + sc + '">' + l.status + '</span>'
+          + '<span class="l-model">' + esc(l.model) + (l.err ? ' <span style="color:var(--err)">· ' + esc(String(l.err).slice(0, 40)) + '</span>' : '') + '</span>'
+          + '<span class="l-acct">' + esc(l.account) + '</span>'
+          + '<span class="l-ms">' + dur + '</span>'
+          + '<span class="l-tag">' + (l.stream ? '流' : '') + '</span>'
+          + '</div>';
+      }).join('')
+    : '<div class="logs-empty">暂无请求记录</div>';
+  // 账号策略高亮（来自服务端设置）
+  var strat = d.settings && d.settings.accountStrategy;
+  var sbtns = document.querySelectorAll('button[data-strat]');
+  sbtns.forEach(function(b) { b.classList.toggle('active', b.dataset.strat === strat); });
 }
 function tick() { api().then(render).catch(function(){}); }
 tick();
@@ -2895,7 +3053,36 @@ document.addEventListener('click', function(ev) {
   var t = ev.target.closest ? ev.target.closest('button[data-delay]') : null;
   if (t && !testing) { runDelay(t.dataset.delay); return; }
   var z = ev.target.closest ? ev.target.closest('#testall') : null;
-  if (z && !testing) runDelay('__all__');
+  if (z && !testing) { runDelay('__all__'); return; }
+});
+
+// ---- 设置弹层 ----
+var gear = document.getElementById('gearBtn');
+var pop = document.getElementById('settingsPop');
+if (gear) gear.addEventListener('click', function(ev) {
+  ev.stopPropagation();
+  pop.classList.toggle('open');
+});
+document.addEventListener('click', function(ev) {
+  if (pop && pop.classList.contains('open') && !pop.contains(ev.target)) pop.classList.remove('open');
+});
+document.querySelectorAll('button[data-theme-set]').forEach(function(b) {
+  b.addEventListener('click', function() { applyTheme(b.dataset.themeSet); });
+});
+document.querySelectorAll('button[data-strat]').forEach(function(b) {
+  b.addEventListener('click', function() {
+    fetch('/admin/api/settings' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountStrategy: b.dataset.strat })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok) toast('账号策略已切换：' + (d.settings.accountStrategy === 'sequential' ? '顺序优先' : '轮询'), 'ok');
+        else toast('设置失败：' + esc(d.error && d.error.message), 'err');
+      })
+      .catch(function(e) { toast('设置请求失败：' + esc(String(e)), 'err'); });
+  });
 });
 </script>
 </body>

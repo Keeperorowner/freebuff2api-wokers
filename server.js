@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -74,6 +74,23 @@ const env = {
   PROXY_PORT_BASE: process.env.PROXY_PORT_BASE || '24001',
   PROXY_REGIONS: process.env.PROXY_REGIONS || '',
   ADMIN_KEY: process.env.ADMIN_KEY || '',
+};
+
+// admin 面板设置持久化（容器层 settings.json：restart 保留，rebuild 重置为 .env 默认）
+const settingsPath = resolve(__dirname, 'settings.json');
+try {
+  if (existsSync(settingsPath)) {
+    const s = JSON.parse(readFileSync(settingsPath, 'utf-8'));
+    if (s && typeof s === 'object') env.ADMIN_SETTINGS = JSON.stringify(s);
+  }
+} catch (err) {
+  console.warn('[server] settings.json unreadable, using defaults:', err.message);
+}
+env.ADMIN_SETTINGS = env.ADMIN_SETTINGS || '';
+globalThis.__freebuffSettingsWriter = (json) => {
+  try { writeFileSync(settingsPath, String(json), 'utf-8'); } catch (err) {
+    console.error('[server] settings write failed:', err.message);
+  }
 };
 
 console.log(`[server] start: ${tokenLines.length} tokens, apiKey=${env.FREEBUFF_API_KEY.slice(0,8)}..., debug=${env.FREEBUFF_DEBUG}`);
