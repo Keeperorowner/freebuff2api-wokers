@@ -5,6 +5,17 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+// 每账号代理出口：注入 undici ProxyAgent 工厂供 worker.js 使用（仅 Node 运行时；
+// Cloudflare Workers 下无此工厂，worker 自动回退直连）。undici 缺失时优雅降级。
+let ProxyAgent = null;
+try {
+  ({ ProxyAgent } = await import('undici'));
+  globalThis.__freebuffProxyAgentFactory = (uri) => new ProxyAgent(uri);
+  console.log('[server] per-account proxy support: ready (undici)');
+} catch {
+  console.warn('[server] undici not installed — per-account proxy disabled (run: npm install)');
+}
+
 // Load worker module
 const worker = await import('./worker.js');
 const handler = worker.default;
@@ -14,6 +25,7 @@ const handler = worker.default;
 // Read tokens from credentials/ directory
 const credDir = resolve(__dirname, 'credentials');
 let tokenLines = [];
+let accountList = [];
 if (existsSync(credDir)) {
   for (const f of readdirSync(credDir)) {
     if (!f.endsWith('.json')) continue;
@@ -21,11 +33,17 @@ if (existsSync(credDir)) {
       const raw = readFileSync(resolve(credDir, f), 'utf-8');
       const obj = JSON.parse(raw);
       // 单账号格式：顶层 authToken（credentials/<name>.json）
-      if (obj.authToken) tokenLines.push(obj.authToken.trim());
+      if (obj.authToken) {
+        tokenLines.push(obj.authToken.trim());
+        accountList.push({ email: obj.email || '', authToken: obj.authToken.trim() });
+      }
       // 多账号聚合格式（freebuff_credentials.json）：accounts.<key>.authToken
       if (obj.accounts && typeof obj.accounts === 'object') {
         for (const acct of Object.values(obj.accounts)) {
-          if (acct && acct.authToken) tokenLines.push(acct.authToken.trim());
+          if (acct && acct.authToken) {
+            tokenLines.push(acct.authToken.trim());
+            accountList.push({ email: acct.email || '', authToken: acct.authToken.trim() });
+          }
         }
       }
     } catch (err) {
@@ -45,15 +63,25 @@ if (envToken) {
 
 const env = {
   FREEBUFF_TOKEN: tokenLines.join(','),
+  FREEBUFF_ACCOUNTS: accountList.length > 0 ? JSON.stringify(accountList) : '',
   FREEBUFF_API_KEY: process.env.FREEBUFF_API_KEY || 'freebuff-default-key',
   FREEBUFF_DEBUG: process.env.FREEBUFF_DEBUG || 'false',
   CODEBUFF_API: process.env.CODEBUFF_API || '',
   RELAY_KEY: process.env.RELAY_KEY || '',
+  // 每账号代理出口（mihomo 多监听端口）
+  PROXY_ENABLED: process.env.PROXY_ENABLED || '',
+  PROXY_HOST: process.env.PROXY_HOST || 'mihomo',
+  PROXY_PORT_BASE: process.env.PROXY_PORT_BASE || '24001',
+  PROXY_REGIONS: process.env.PROXY_REGIONS || '',
+  ADMIN_KEY: process.env.ADMIN_KEY || '',
 };
 
 console.log(`[server] start: ${tokenLines.length} tokens, apiKey=${env.FREEBUFF_API_KEY.slice(0,8)}..., debug=${env.FREEBUFF_DEBUG}`);
 if (env.CODEBUFF_API) console.log(`[server] CODEBUFF_API=${env.CODEBUFF_API}`);
 if (env.RELAY_KEY) console.log(`[server] RELAY_KEY set`);
+if (ProxyAgent && (process.env.PROXY_ENABLED === '1' || process.env.PROXY_ENABLED === 'true')) {
+  console.log(`[server] per-account proxy: enabled via ${env.PROXY_HOST} (port base ${env.PROXY_PORT_BASE}, regions: ${env.PROXY_REGIONS || 'default'})`);
+}
 
 // === HTTP server ===
 const port = parseInt(process.env.PORT || '8787', 10);

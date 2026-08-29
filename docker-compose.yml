@@ -1,20 +1,41 @@
 version: "3.8"
 
 services:
+  # 每账号出口路由：订阅经 proxy-provider 导入，每个区域一个 url-test 组
+  # + 独立 HTTP 监听端口。worker.js 按账号哈希绑定区域端口。
+  # 首次使用：1) .env 里填 SUB_URL  2) node scripts/gen-mihomo-config.mjs
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: freebuff-mihomo
+    restart: unless-stopped
+    volumes:
+      - ./deploy/mihomo:/root/.config/mihomo
+    # 不发布端口：区域监听与 API 仅容器网络内可达
+
   freebuff2api:
-    image: ${DOCKERHUB_USERNAME}/freebuff2api:latest
+    build: .
     container_name: freebuff2api
     restart: unless-stopped
     ports:
       - "8877:8787"
+    depends_on:
+      - mihomo
     environment:
       - PORT=8787
       - HOST=0.0.0.0
       # 上游地址：默认空=直连官方 www.codebuff.com；如走自建中继可设为中继域名
       - CODEBUFF_API=
       - RELAY_KEY=${RELAY_KEY}
-      - FREEBUFF_API_KEY=${FREEBUFF_API_KEY}
+      - FREEBUFF_API_KEY=${FREEBUFF_API_KEY:-freebuff-default-key}
       - FREEBUFF_DEBUG=false
+      # 每账号代理出口（mihomo 多区域监听端口）；区域 = freebuff 支持国家，
+      # 实际生效列表由 scripts/gen-mihomo-config.mjs 按订阅节点收敛后写回 .env
+      - PROXY_ENABLED=${PROXY_ENABLED:-1}
+      - PROXY_HOST=mihomo
+      - PROXY_PORT_BASE=${PROXY_PORT_BASE:-24001}
+      - PROXY_REGIONS=${PROXY_REGIONS:-US,CA,UK,AU,NZ,NO,SE,NL,DK,DE,FR,IT,ES,PT,FI,BE,LU,LI,CH,AT,SG,MT,IL,IE,IS}
+      # admin 面板（/admin）访问密钥；为空则本地开放
+      - ADMIN_KEY=${ADMIN_KEY:-}
     volumes:
-      # 统一凭证：直接复用本地工具的 freebuff_credentials.json（多账号聚合格式）
-      - ./freebuff_tools/freebuff_credentials.json:/app/credentials/freebuff_credentials.json:ro
+      - ./credentials:/app/credentials:ro
+      - ./worker.js:/app/worker.js:ro

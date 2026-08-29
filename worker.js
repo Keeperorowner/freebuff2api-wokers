@@ -1,7 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.10.2";
+const VERSION = "1.8.10.2-nfp2";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 const SDK_UA = "ai-sdk/openai-compatible/1.0.25/codebuff";
 const DESKTOP_UA = "Freebuff-CLI/0.0.138";
@@ -198,7 +198,9 @@ async function fetchSourceList(urls) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
+      // GitHub 源在 CN 网络直连不稳：启用代理时统一走第一个区域出口
+      const d = infraDispatcher();
+      const resp = await fetch(url, { signal: ctrl.signal, ...(d ? { dispatcher: d } : {}) });
       clearTimeout(timer);
       if (resp.ok) {
         const text = await resp.text();
@@ -273,7 +275,8 @@ async function tryReleaseFallback() {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
+      const d = infraDispatcher();
+      const resp = await fetch(url, { signal: ctrl.signal, ...(d ? { dispatcher: d } : {}) });
       clearTimeout(timer);
       if (resp.ok) {
         const json = await resp.json();
@@ -392,6 +395,13 @@ export default {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
+    updateRuntimeConfig(env);
+
+    // admin 面板：独立鉴权（ADMIN_KEY），与业务 API key 分离，仅供运维观察
+    if (url.pathname === "/admin" || url.pathname === "/admin/") return handleAdminPage(request, url);
+    if (url.pathname === "/admin/api/state") return handleAdminState(request, env, url);
+    if (url.pathname === "/admin/api/delay") return handleAdminDelay(request, env, url);
+
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
       // 健康检查只读 Worker 最近一次真实请求形成的本地快照。
@@ -445,6 +455,19 @@ const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId,
 
 
 function parseAccounts(env) {
+  // 优先 FREEBUFF_ACCOUNTS（server.js 从 credentials 目录取 [{email, authToken}]），
+  // 供 admin 面板显示账号身份；格式异常时回退 FREEBUFF_TOKEN。
+  if (env.FREEBUFF_ACCOUNTS) {
+    try {
+      const arr = JSON.parse(env.FREEBUFF_ACCOUNTS);
+      if (Array.isArray(arr)) {
+        const out = arr
+          .filter((a) => a && typeof a.authToken === "string" && a.authToken.trim().length > 8)
+          .map((a) => ({ token: a.authToken.trim(), uid: null, email: a.email || null }));
+        if (out.length > 0) return out;
+      }
+    } catch {}
+  }
   // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
   // 例："t1\nt2:u2\nt3,u4:u4" → [{token:t1,uid:null},{token:t2,uid:u2},...]
   return (env.FREEBUFF_TOKEN || "").split(/[\n,]/)
@@ -531,6 +554,182 @@ function summarizeAccountHealth(pool, health) {
     account_states,
     account_details,
   };
+}
+
+// ---------------------------------------------------------------------------
+// admin 面板（/admin）：账号/出口区域/配额/请求统计。只读本地状态与
+// mihomo API，绝不为面板主动探测上游（避免制造可疑行为）。
+// ---------------------------------------------------------------------------
+const adminStats = { startedAt: Date.now(), totalRequests: 0, totalErrors: 0, lastRequestAt: null };
+const accountStats = new Map(); // token -> { requests, errors, lastUsedAt }
+
+function noteRequest() {
+  adminStats.totalRequests++;
+  adminStats.lastRequestAt = new Date().toISOString();
+}
+
+function noteAccountUse(token) {
+  let s = accountStats.get(token);
+  if (!s) { s = { requests: 0, errors: 0, lastUsedAt: null }; accountStats.set(token, s); }
+  s.requests++;
+  s.lastUsedAt = Date.now();
+}
+
+function noteAccountError(token) {
+  adminStats.totalErrors++;
+  const s = accountStats.get(token);
+  if (s) s.errors++;
+}
+
+function adminAuthorized(request, url) {
+  if (!RT.adminKey) return true; // 未设 ADMIN_KEY：本地部署默认开放
+  const q = url.searchParams.get("key");
+  if (q && q === RT.adminKey) return true;
+  const auth = request.headers.get("Authorization") || "";
+  return auth === "Bearer " + RT.adminKey;
+}
+
+// mihomo REST API（external-controller :9090）读区域组当前节点与延迟
+async function mihomoRegionStatus() {
+  if (!RT.proxyEnabled || !RT.proxyHost) return null;
+  try {
+    // 组结构在 /proxies，但 provider 节点不在其中——节点延迟历史在
+    // /providers/proxies（health-check 每 10 分钟自动刷新）。
+    // 纯被动读取本地 mihomo 状态，不产生任何外发流量。
+    const [groupsResp, provResp] = await Promise.all([
+      fetch("http://" + RT.proxyHost + ":9090/proxies", { signal: AbortSignal.timeout(3000) }),
+      fetch("http://" + RT.proxyHost + ":9090/providers/proxies", { signal: AbortSignal.timeout(3000) }),
+    ]);
+    if (!groupsResp.ok || !provResp.ok) return null;
+    const groups = await groupsResp.json();
+    const provs = await provResp.json();
+    const nodeDelay = new Map();
+    for (const prov of Object.values(provs.providers || {})) {
+      if (!Array.isArray(prov.proxies)) continue;
+      for (const p of prov.proxies) {
+        const hist = Array.isArray(p.history) && p.history.length ? p.history[p.history.length - 1] : null;
+        if (hist && typeof hist.delay === "number" && hist.delay > 0) nodeDelay.set(p.name, hist.delay);
+      }
+    }
+    const out = {};
+    for (const region of RT.regions) {
+      const g = groups.proxies && groups.proxies["exit-" + region];
+      if (!g || !g.now) { out[region] = null; continue; }
+      out[region] = { node: g.now, delay: nodeDelay.has(g.now) ? nodeDelay.get(g.now) : null };
+    }
+    return out;
+  } catch { return null; }
+}
+
+async function handleAdminState(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  const pool = parseAccounts(env);
+  const mihomo = await mihomoRegionStatus();
+  const regions = RT.regions.map((code, i) => {
+    const meta = REGION_META[code];
+    const m = mihomo ? mihomo[code] : null;
+    return {
+      code, name: meta.name, flag: meta.flag, port: RT.portBase + i,
+      node: m ? m.node : null, delay: m ? m.delay : null,
+    };
+  });
+  const accounts = pool.map((acct) => {
+    const h = acctHealth.get(acct.token) || null;
+    const st = accountStats.get(acct.token) || { requests: 0, errors: 0, lastUsedAt: null };
+    const region = accountRegion(acct.token);
+    const regionIdx = region ? RT.regions.indexOf(region) : -1;
+    const profile = accountDeviceProfile(acct.token);
+    const cdUntil = cooldowns.get(acct.token) || 0;
+    let activeSessions = 0;
+    for (const k of sessCache.keys()) {
+      if (k.startsWith(acct.token + ":") && isUsableSession(sessCache.get(k))) activeSessions++;
+    }
+    const quota = h && h.quota && typeof h.quota === "object"
+      ? Object.entries(h.quota).map(([model, e]) => ({
+          model,
+          limit: e && typeof e.limit === "number" ? e.limit : null,
+          remaining: e && typeof e.limit === "number" && typeof e.recentCount === "number" ? e.limit - e.recentCount : null,
+        }))
+      : [];
+    return {
+      email: acct.email || acct.token.slice(0, 8) + "...",
+      state: h ? h.state : "unknown",
+      alive: h ? h.alive : null,
+      checkedAt: h ? h.checkedAt : null,
+      region: region ? { code: region, name: REGION_META[region].name, flag: REGION_META[region].flag, port: regionIdx >= 0 ? RT.portBase + regionIdx : null } : null,
+      device: profile,
+      quota,
+      cooldownUntil: cdUntil > Date.now() ? cdUntil : null,
+      activeSessions,
+      requests: st.requests,
+      errors: st.errors,
+      lastUsedAt: st.lastUsedAt,
+    };
+  });
+  return jsonResponse({
+    version: VERSION,
+    time: new Date().toISOString(),
+    uptimeSec: Math.floor((Date.now() - adminStats.startedAt) / 1000),
+    proxy: {
+      enabled: RT.proxyEnabled,
+      host: RT.proxyHost,
+      portBase: RT.portBase,
+      mihomoApi: mihomo ? "ok" : "unreachable",
+      regions,
+    },
+    stats: { ...adminStats, accountsTracked: accountStats.size },
+    accounts,
+  }, 200);
+}
+
+function handleAdminPage(request, url) {
+  if (!adminAuthorized(request, url)) return new Response("invalid admin key", { status: 401 });
+  return new Response(ADMIN_HTML, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache", "Expires": "0" },
+  });
+}
+
+// 手动延迟测试：POST /admin/api/delay {region:"US"} 或 {} = 全部区域。
+// 通过 mihomo REST API 对指定 exit-<region> 组做 /group/delay（测组内所有
+// 节点，同时刷新 url-test 选点），并把测速结果写回组内每个节点的 history。
+async function handleAdminDelay(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  if (request.method !== "POST") return jsonResponse({ error: { message: "POST only" } }, 405);
+  if (!RT.proxyEnabled || !RT.proxyHost) return jsonResponse({ error: { message: "proxy not enabled" } }, 400);
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const region = typeof body.region === "string" ? body.region.toUpperCase() : null;
+  const targets = region
+    ? RT.regions.filter((r) => r === region)
+    : RT.regions;
+  if (targets.length === 0) return jsonResponse({ error: { message: "unknown region: " + region } }, 400);
+  const testUrl = String(body.url || "https://www.gstatic.com/generate_204");
+  const timeout = Math.min(parseInt(body.timeout || "5000", 10) || 5000, 10000);
+  // 逐组串行测速（mihomo 组内节点本身并行），避免同时打爆订阅节点
+  const results = {};
+  for (const r of targets) {
+    try {
+      const resp = await fetch(
+        "http://" + RT.proxyHost + ":9090/group/" + encodeURIComponent("exit-" + r) + "/delay?url=" + encodeURIComponent(testUrl) + "&timeout=" + timeout,
+        { method: "GET", signal: AbortSignal.timeout(timeout + 8000) },
+      );
+      const data = await resp.json().catch(() => null);
+      if (data && typeof data === "object" && !data.message) {
+        const delays = Object.values(data).filter((v) => typeof v === "number");
+        results[r] = {
+          ok: true, nodes: delays.length,
+          min: delays.length ? Math.min(...delays) : null,
+          max: delays.length ? Math.max(...delays) : null,
+        };
+      } else {
+        results[r] = { ok: false, error: String((data && data.message) || ("HTTP " + resp.status)).slice(0, 120) };
+      }
+    } catch (e) {
+      results[r] = { ok: false, error: String(e.message || e).slice(0, 120) };
+    }
+  }
+  return jsonResponse({ time: new Date().toISOString(), results }, 200);
 }
 
 function pickToken(env, sessionModel) {
@@ -741,11 +940,13 @@ async function deleteUpstreamSession(token, instanceId) {
 // ---------------------------------------------------------------------------
 
 let chainTail = Promise.resolve();
-const CHAIN_GAP_MS = 300; // 上游免费通道并发 >1 会出问题，串行+小间隔；300ms 足够防抖且链路总耗时可控
+// 上游免费通道并发 >1 会出问题，串行+小间隔防抖。间隔带随机抖动：
+// 固定 300ms 节律在服务端是明显的机器特征。
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
 function enqueue(fn) {
-  const run = chainTail.then(() => sleep(CHAIN_GAP_MS)).then(fn);
+  const gap = 250 + Math.floor(Math.random() * 450);
+  const run = chainTail.then(() => sleep(gap)).then(fn);
   chainTail = run.catch(() => {});
   return run;
 }
@@ -765,11 +966,14 @@ async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPST
   if (body !== undefined) headers["Content-Type"] = "application/json";
   Object.assign(headers, extraHeaders);
 
+  // 每账号出口：经绑定的 mihomo 区域端口（未启用代理时为 undefined，直连）
+  const dispatcher = token ? proxyDispatcherFor(token) : undefined;
   const resp = await fetch(CODEBUFF_API + path, {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(timeoutMs),
+    ...(dispatcher ? { dispatcher } : {}),
   });
   const text = await resp.text();
   let data = null;
@@ -896,6 +1100,277 @@ function stableFingerprint(token) {
   return "enhanced-" + h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
 }
 
+// 设备画像：os 全局池；timezone/locale 优先从账号绑定的出口区域本地池派生
+// （geo 一致性：出口 IP 地理位置、时区、语言三者互证），未启用代理时回退全局混合池。
+const DEVICE_OS_POOL = ["macos", "windows", "linux"];
+// 代理未启用时的回退池（原自由混合分布）
+const FALLBACK_DEVICE_POOL = [
+  { timezone: "America/New_York", locale: "en-US" },
+  { timezone: "America/Chicago", locale: "en-US" },
+  { timezone: "America/Denver", locale: "en-US" },
+  { timezone: "America/Los_Angeles", locale: "en-US" },
+  { timezone: "America/Toronto", locale: "en-CA" },
+  { timezone: "America/Vancouver", locale: "en-CA" },
+  { timezone: "Europe/London", locale: "en-GB" },
+  { timezone: "Europe/Dublin", locale: "en-IE" },
+  { timezone: "Australia/Sydney", locale: "en-AU" },
+  { timezone: "Australia/Melbourne", locale: "en-AU" },
+  { timezone: "Pacific/Auckland", locale: "en-NZ" },
+  { timezone: "Europe/Oslo", locale: "nb-NO" },
+  { timezone: "Europe/Oslo", locale: "en-US" },
+  { timezone: "Europe/Stockholm", locale: "sv-SE" },
+  { timezone: "Europe/Stockholm", locale: "en-US" },
+  { timezone: "Europe/Amsterdam", locale: "nl-NL" },
+  { timezone: "Europe/Amsterdam", locale: "en-US" },
+  { timezone: "Europe/Copenhagen", locale: "da-DK" },
+  { timezone: "Europe/Copenhagen", locale: "en-US" },
+  { timezone: "Europe/Helsinki", locale: "fi-FI" },
+  { timezone: "Europe/Helsinki", locale: "en-US" },
+  { timezone: "Atlantic/Reykjavik", locale: "is-IS" },
+  { timezone: "Atlantic/Reykjavik", locale: "en-US" },
+  { timezone: "Europe/Berlin", locale: "de-DE" },
+  { timezone: "Europe/Berlin", locale: "en-US" },
+  { timezone: "Europe/Vienna", locale: "de-AT" },
+  { timezone: "Europe/Vienna", locale: "en-US" },
+  { timezone: "Europe/Zurich", locale: "de-CH" },
+  { timezone: "Europe/Zurich", locale: "en-US" },
+  { timezone: "Europe/Vaduz", locale: "de-LI" },
+  { timezone: "Europe/Vaduz", locale: "en-US" },
+  { timezone: "Europe/Paris", locale: "fr-FR" },
+  { timezone: "Europe/Paris", locale: "en-US" },
+  { timezone: "Europe/Luxembourg", locale: "fr-LU" },
+  { timezone: "Europe/Luxembourg", locale: "en-US" },
+  { timezone: "Europe/Brussels", locale: "nl-BE" },
+  { timezone: "Europe/Brussels", locale: "fr-BE" },
+  { timezone: "Europe/Brussels", locale: "en-US" },
+  { timezone: "Europe/Rome", locale: "it-IT" },
+  { timezone: "Europe/Rome", locale: "en-US" },
+  { timezone: "Europe/Madrid", locale: "es-ES" },
+  { timezone: "Europe/Madrid", locale: "en-US" },
+  { timezone: "Europe/Lisbon", locale: "pt-PT" },
+  { timezone: "Europe/Lisbon", locale: "en-US" },
+  { timezone: "Europe/Malta", locale: "en-MT" },
+  { timezone: "Europe/Malta", locale: "mt-MT" },
+  { timezone: "Asia/Singapore", locale: "en-SG" },
+  { timezone: "Asia/Singapore", locale: "zh-SG" },
+  { timezone: "Asia/Jerusalem", locale: "he-IL" },
+  { timezone: "Asia/Jerusalem", locale: "en-US" },
+];
+
+// FNV-1a 带 salt：同一 token 在不同池上得到互不相关的索引
+function hashPick(input, salt, pool) {
+  let h = (0x811c9dc5 ^ salt) >>> 0;
+  const s = salt + ":" + input;
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(h ^ s.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  return pool[h % pool.length];
+}
+
+// ---------------------------------------------------------------------------
+// 出口区域与代理路由（Docker 部署 + mihomo 多监听端口）：
+// 每个账号按 token 确定性绑定一个区域（PROXY_REGIONS 顺序 + FNV 哈希），
+// 该账号所有上游请求经 mihomo 对应端口（PROXY_PORT_BASE + 区域序号）出走。
+// 出口 IP 稳定（同号永远同区域），且与设备画像地理一致（IP/时区/语言互证）。
+// dispatcher 由 server.js 注入的 globalThis.__freebuffProxyAgentFactory 创建；
+// Cloudflare Workers 下工厂不存在，自动回退直连。
+// ---------------------------------------------------------------------------
+// 区域表 = freebuff 官方支持的国家/地区（服务可用区域）：
+// 出口只走这些区域，避免 country_blocked；HK/TW/JP/KR 等不在支持列表，不设出口。
+const REGION_META = {
+  US: { name: "United States", flag: "🇺🇸", device: [
+    { timezone: "America/New_York", locale: "en-US" },
+    { timezone: "America/Chicago", locale: "en-US" },
+    { timezone: "America/Denver", locale: "en-US" },
+    { timezone: "America/Los_Angeles", locale: "en-US" },
+    { timezone: "America/Phoenix", locale: "en-US" },
+  ] },
+  CA: { name: "Canada", flag: "🇨🇦", device: [
+    { timezone: "America/Toronto", locale: "en-CA" },
+    { timezone: "America/Vancouver", locale: "en-CA" },
+    { timezone: "America/Toronto", locale: "en-US" },
+  ] },
+  UK: { name: "United Kingdom", flag: "🇬🇧", device: [
+    { timezone: "Europe/London", locale: "en-GB" },
+    { timezone: "Europe/London", locale: "en-GB" },
+    { timezone: "Europe/London", locale: "en-US" },
+  ] },
+  AU: { name: "Australia", flag: "🇦🇺", device: [
+    { timezone: "Australia/Sydney", locale: "en-AU" },
+    { timezone: "Australia/Melbourne", locale: "en-AU" },
+    { timezone: "Australia/Perth", locale: "en-AU" },
+  ] },
+  NZ: { name: "New Zealand", flag: "🇳🇿", device: [
+    { timezone: "Pacific/Auckland", locale: "en-NZ" },
+    { timezone: "Pacific/Auckland", locale: "en-NZ" },
+    { timezone: "Pacific/Auckland", locale: "en-US" },
+  ] },
+  NO: { name: "Norway", flag: "🇳🇴", device: [
+    { timezone: "Europe/Oslo", locale: "nb-NO" },
+    { timezone: "Europe/Oslo", locale: "nb-NO" },
+    { timezone: "Europe/Oslo", locale: "en-US" },
+  ] },
+  SE: { name: "Sweden", flag: "🇸🇪", device: [
+    { timezone: "Europe/Stockholm", locale: "sv-SE" },
+    { timezone: "Europe/Stockholm", locale: "sv-SE" },
+    { timezone: "Europe/Stockholm", locale: "en-US" },
+  ] },
+  NL: { name: "Netherlands", flag: "🇳🇱", device: [
+    { timezone: "Europe/Amsterdam", locale: "nl-NL" },
+    { timezone: "Europe/Amsterdam", locale: "nl-NL" },
+    { timezone: "Europe/Amsterdam", locale: "en-US" },
+  ] },
+  DK: { name: "Denmark", flag: "🇩🇰", device: [
+    { timezone: "Europe/Copenhagen", locale: "da-DK" },
+    { timezone: "Europe/Copenhagen", locale: "da-DK" },
+    { timezone: "Europe/Copenhagen", locale: "en-US" },
+  ] },
+  DE: { name: "Germany", flag: "🇩🇪", device: [
+    { timezone: "Europe/Berlin", locale: "de-DE" },
+    { timezone: "Europe/Berlin", locale: "de-DE" },
+    { timezone: "Europe/Berlin", locale: "en-US" },
+  ] },
+  FR: { name: "France", flag: "🇫🇷", device: [
+    { timezone: "Europe/Paris", locale: "fr-FR" },
+    { timezone: "Europe/Paris", locale: "fr-FR" },
+    { timezone: "Europe/Paris", locale: "en-US" },
+  ] },
+  IT: { name: "Italy", flag: "🇮🇹", device: [
+    { timezone: "Europe/Rome", locale: "it-IT" },
+    { timezone: "Europe/Rome", locale: "it-IT" },
+    { timezone: "Europe/Rome", locale: "en-US" },
+  ] },
+  ES: { name: "Spain", flag: "🇪🇸", device: [
+    { timezone: "Europe/Madrid", locale: "es-ES" },
+    { timezone: "Europe/Madrid", locale: "es-ES" },
+    { timezone: "Europe/Madrid", locale: "en-US" },
+  ] },
+  PT: { name: "Portugal", flag: "🇵🇹", device: [
+    { timezone: "Europe/Lisbon", locale: "pt-PT" },
+    { timezone: "Europe/Lisbon", locale: "pt-PT" },
+    { timezone: "Europe/Lisbon", locale: "en-US" },
+  ] },
+  FI: { name: "Finland", flag: "🇫🇮", device: [
+    { timezone: "Europe/Helsinki", locale: "fi-FI" },
+    { timezone: "Europe/Helsinki", locale: "fi-FI" },
+    { timezone: "Europe/Helsinki", locale: "en-US" },
+  ] },
+  BE: { name: "Belgium", flag: "🇧🇪", device: [
+    { timezone: "Europe/Brussels", locale: "nl-BE" },
+    { timezone: "Europe/Brussels", locale: "fr-BE" },
+    { timezone: "Europe/Brussels", locale: "en-US" },
+  ] },
+  LU: { name: "Luxembourg", flag: "🇱🇺", device: [
+    { timezone: "Europe/Luxembourg", locale: "fr-LU" },
+    { timezone: "Europe/Luxembourg", locale: "fr-LU" },
+    { timezone: "Europe/Luxembourg", locale: "en-US" },
+  ] },
+  LI: { name: "Liechtenstein", flag: "🇱🇮", device: [
+    { timezone: "Europe/Vaduz", locale: "de-LI" },
+    { timezone: "Europe/Vaduz", locale: "de-LI" },
+    { timezone: "Europe/Vaduz", locale: "en-US" },
+  ] },
+  CH: { name: "Switzerland", flag: "🇨🇭", device: [
+    { timezone: "Europe/Zurich", locale: "de-CH" },
+    { timezone: "Europe/Zurich", locale: "de-CH" },
+    { timezone: "Europe/Zurich", locale: "en-US" },
+  ] },
+  AT: { name: "Austria", flag: "🇦🇹", device: [
+    { timezone: "Europe/Vienna", locale: "de-AT" },
+    { timezone: "Europe/Vienna", locale: "de-AT" },
+    { timezone: "Europe/Vienna", locale: "en-US" },
+  ] },
+  SG: { name: "Singapore", flag: "🇸🇬", device: [
+    { timezone: "Asia/Singapore", locale: "en-SG" },
+    { timezone: "Asia/Singapore", locale: "en-SG" },
+    { timezone: "Asia/Singapore", locale: "zh-SG" },
+  ] },
+  MT: { name: "Malta", flag: "🇲🇹", device: [
+    { timezone: "Europe/Malta", locale: "en-MT" },
+    { timezone: "Europe/Malta", locale: "en-MT" },
+    { timezone: "Europe/Malta", locale: "mt-MT" },
+  ] },
+  IL: { name: "Israel", flag: "🇮🇱", device: [
+    { timezone: "Asia/Jerusalem", locale: "he-IL" },
+    { timezone: "Asia/Jerusalem", locale: "he-IL" },
+    { timezone: "Asia/Jerusalem", locale: "en-US" },
+  ] },
+  IE: { name: "Ireland", flag: "🇮🇪", device: [
+    { timezone: "Europe/Dublin", locale: "en-IE" },
+    { timezone: "Europe/Dublin", locale: "en-IE" },
+    { timezone: "Europe/Dublin", locale: "en-US" },
+  ] },
+  IS: { name: "Iceland", flag: "🇮🇸", device: [
+    { timezone: "Atlantic/Reykjavik", locale: "is-IS" },
+    { timezone: "Atlantic/Reykjavik", locale: "is-IS" },
+    { timezone: "Atlantic/Reykjavik", locale: "en-US" },
+  ] },
+};
+// 默认 = freebuff 支持区域全集；实际生效列表由部署 .env 的 PROXY_REGIONS 提供
+// （gen-mihomo-config.mjs 按「订阅里真实存在的节点」收敛后写回）
+const DEFAULT_REGIONS = "US,CA,UK,AU,NZ,NO,SE,NL,DK,DE,FR,IT,ES,PT,FI,BE,LU,LI,CH,AT,SG,MT,IL,IE,IS";
+
+let RT = { proxyEnabled: false, proxyHost: "", portBase: 24001, regions: [], adminKey: "" };
+function updateRuntimeConfig(env) {
+  const regions = String(env.PROXY_REGIONS || DEFAULT_REGIONS)
+    .split(",").map((s) => s.trim().toUpperCase()).filter((c) => REGION_META[c]);
+  const enableFlag = String(env.PROXY_ENABLED || "").trim().toLowerCase();
+  RT = {
+    proxyEnabled: enableFlag === "1" || enableFlag === "true",
+    proxyHost: String(env.PROXY_HOST || "mihomo"),
+    portBase: parseInt(env.PROXY_PORT_BASE || "24001", 10) || 24001,
+    regions,
+    adminKey: String(env.ADMIN_KEY || ""),
+  };
+}
+
+function accountRegion(token) {
+  if (!RT.proxyEnabled || RT.regions.length === 0) return null;
+  return hashPick(token, 0x51ed, RT.regions);
+}
+
+const proxyAgents = new Map(); // 端口 -> ProxyAgent 实例（跨请求复用连接池）
+function proxyDispatcherFor(token) {
+  if (!RT.proxyEnabled || !token) return undefined;
+  const factory = globalThis.__freebuffProxyAgentFactory;
+  if (!factory) return undefined;
+  const region = accountRegion(token);
+  const idx = region ? RT.regions.indexOf(region) : -1;
+  if (idx < 0) return undefined;
+  const port = RT.portBase + idx;
+  let agent = proxyAgents.get(port);
+  if (!agent) {
+    agent = factory("http://" + RT.proxyHost + ":" + port);
+    proxyAgents.set(port, agent);
+  }
+  return agent;
+}
+
+// 非账号流量（GitHub 模型源等）共用第一个区域的出口
+function infraDispatcher() {
+  if (!RT.proxyEnabled || RT.regions.length === 0) return undefined;
+  const factory = globalThis.__freebuffProxyAgentFactory;
+  if (!factory) return undefined;
+  const port = RT.portBase;
+  let agent = proxyAgents.get(port);
+  if (!agent) {
+    agent = factory("http://" + RT.proxyHost + ":" + port);
+    proxyAgents.set(port, agent);
+  }
+  return agent;
+}
+
+function accountDeviceProfile(token) {
+  const region = accountRegion(token);
+  const pool = region && REGION_META[region] ? REGION_META[region].device : FALLBACK_DEVICE_POOL;
+  const tzLocale = hashPick(token, 0x9e37, pool);
+  return {
+    os: hashPick(token, 0x85eb, DEVICE_OS_POOL),
+    timezone: tzLocale.timezone,
+    locale: tzLocale.locale,
+  };
+}
+
 // 广告链：POST /ads 拉取 → 若有 impUrl 则 POST /ads/impression 上报曝光。
 // 官方实现：getCliAdRequestUserAgent 发 Freebuff-CLI/<version> UA；
 // body {provider:"gravity", surface, sessionId, device, userAgent}；曝光 {impUrl, mode}
@@ -908,11 +1383,13 @@ async function runNormalClientBehavior(token, clientFingerprint) {
         provider: "gravity",
         sessionId: crypto.randomUUID(),
         surface: "waiting_room",
-        device: { os: "macos", timezone: "Asia/Shanghai", locale: "zh-CN" },
+        device: accountDeviceProfile(token),
         userAgent: DESKTOP_UA,
       }, { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
       const impUrl = ad.data && Array.isArray(ad.data.ads) && ad.data.ads[0] && ad.data.ads[0].impUrl;
       if (ad.status === 200 && impUrl) {
+        // 广告"浏览"时长：真实客户端从拉到广告到上报曝光有 1-3s 展示间隔
+        await sleep(900 + Math.floor(Math.random() * 2400));
         await enqueueUp("POST", "/api/v1/ads/impression", token,
           { impUrl, mode: "free" },
           { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
@@ -1379,6 +1856,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
+    noteAccountUse(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     let rootRunId = null;
@@ -1397,11 +1875,13 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         "Content-Type": "application/json",
         "x-freebuff-instance-id": sess.instanceId,
       };
+      const dispatcher = proxyDispatcherFor(token);
       const resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
         signal: isStream ? undefined : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+        ...(dispatcher ? { dispatcher } : {}),
       });
       if (!resp.ok) {
         const text = await resp.text();
@@ -1436,6 +1916,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
     } catch (e) {
       console.error("[code_review]", e);
+      noteAccountError(token);
       // 官方下线模型：全局失败，立即返回，不换号。
       if (e instanceof ModelUnavailableError) {
         return jsonResponse({ error: { message: "Model not available upstream: " + e.modelId + "（官方已下线/暂停该模型）", type: "unsupported_model" } }, 400);
@@ -1452,6 +1933,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
 async function executeChat(env, chatParams, mc, isStream, mode) {
   if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
+  noteRequest();
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
@@ -1463,6 +1945,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
+    noteAccountUse(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     try {
@@ -1477,6 +1960,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       // 3) chat（428 waiting_room_required / 409 session_superseded = session 失效，
       //    清缓存强制重建后重试一次；仍失败则冷却该号交给外层换号）
       let resp, errText = "", sessForChat = sess;
+      const dispatcher = proxyDispatcherFor(token);
       for (let attempt = 0; attempt < 2; attempt++) {
         const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
         const headers = {
@@ -1493,6 +1977,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         const chatInit = {
           method: "POST", headers, body: JSON.stringify(payload),
+          ...(dispatcher ? { dispatcher } : {}),
         };
         try {
           resp = isStream
@@ -1560,6 +2045,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
+      noteAccountError(token);
       const msg = String(e.message || e);
       // 官方下线模型：全局失败，立即向客户端返回明确错误，不换号、不计冷却。
       if (e instanceof ModelUnavailableError) {
@@ -2209,3 +2695,208 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-freebuff-instance-id, anthropic-version, anthropic-beta",
   };
 }
+
+// ---------------------------------------------------------------------------
+// admin 面板 HTML（单文件、零依赖、暗色主题，5s 轮询本地状态 API）
+// ---------------------------------------------------------------------------
+const ADMIN_HTML = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>freebuff2api · admin</title>
+<style>
+  :root { --bg:#0e1116; --card:#161b23; --border:#232b37; --text:#d7dde6; --dim:#8b95a5; --accent:#4f8cff; --ok:#34d399; --warn:#fbbf24; --err:#f87171; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif; padding:24px; }
+  h1 { font-size:18px; margin-bottom:4px; }
+  h2 { font-size:14px; color:var(--dim); margin:28px 0 12px; text-transform:uppercase; letter-spacing:.08em; }
+  header .sub { color:var(--dim); font-size:12px; }
+  .summary { display:flex; gap:16px; flex-wrap:wrap; margin-top:12px; }
+  .summary .item { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px 16px; min-width:120px; }
+  .summary .item b { display:block; font-size:20px; font-weight:600; }
+  .summary .item span { color:var(--dim); font-size:12px; }
+  .banner { background:#2b2313; border:1px solid #6b5416; color:var(--warn); border-radius:10px; padding:10px 14px; margin-top:14px; font-size:13px; }
+  .toast { position:fixed; left:50%; bottom:28px; transform:translateX(-50%); max-width:90vw; padding:10px 18px; border-radius:10px; font-size:13px; border:1px solid; box-shadow:0 4px 16px rgba(0,0,0,.4); opacity:0; pointer-events:none; transition:opacity .25s; z-index:9; }
+  .toast.show { opacity:1; }
+  .toast-ok { background:#0f2318; border-color:var(--ok); color:var(--ok); }
+  .toast-err { background:#2b1313; border-color:var(--err); color:var(--err); }
+  .toast-warn { background:#2b2313; border-color:var(--warn); color:var(--warn); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .card .head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }
+  .card .head .title { font-weight:600; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:99px; border:1px solid; white-space:nowrap; }
+  .b-ok { color:var(--ok); border-color:var(--ok); background:rgba(52,211,153,.08); }
+  .b-err { color:var(--err); border-color:var(--err); background:rgba(248,113,113,.08); }
+  .b-warn { color:var(--warn); border-color:var(--warn); background:rgba(251,191,36,.08); }
+  .b-dim { color:var(--dim); border-color:var(--dim); }
+  .row { display:flex; justify-content:space-between; gap:10px; padding:3px 0; font-size:13px; }
+  .row .k { color:var(--dim); flex-shrink:0; }
+  .row .v { text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .quota { margin-top:8px; border-top:1px dashed var(--border); padding-top:8px; }
+  .quota .row { font-size:12px; }
+  .delay-ok { color:var(--ok); } .delay-warn { color:var(--warn); } .delay-err { color:var(--err); } .delay-none { color:var(--dim); }
+  .err { color:var(--err); padding:24px; }
+  .btn { margin-top:10px; width:100%; padding:6px 0; font:inherit; font-size:12px; color:var(--accent); background:transparent; border:1px solid var(--accent); border-radius:8px; cursor:pointer; }
+  .btn:hover { background:rgba(79,140,255,.12); }
+  .btn:disabled { opacity:.45; cursor:default; }
+  .btn.testing { color:var(--warn); border-color:var(--warn); }
+  .sec-head { display:flex; align-items:center; justify-content:space-between; margin:28px 0 12px; }
+  .sec-head h2 { margin:0; }
+  .zap { font-size:16px; line-height:1; padding:6px 12px; color:var(--accent); background:transparent; border:1px solid var(--border); border-radius:8px; cursor:pointer; }
+  .zap:hover { border-color:var(--accent); background:rgba(79,140,255,.12); }
+  .zap.busy { color:var(--warn); border-color:var(--warn); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.5; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>freebuff2api admin</h1>
+  <div class="sub" id="sub">加载中…</div>
+  <div class="summary" id="summary"></div>
+  <div id="warn"></div>
+</header>
+<div class="toast" id="toast"></div>
+<div class="sec-head"><h2>出口区域</h2><button class="zap" id="testall" title="全部区域测速">⚡</button></div>
+<div class="cards" id="regions"></div>
+<h2>账号</h2>
+<div class="cards" id="accounts"></div>
+<script>
+var KEY = new URLSearchParams(location.search).get('key') || '';
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function ago(ts) {
+  if (!ts) return '从未';
+  var s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return s + ' 秒前';
+  if (s < 3600) return Math.floor(s/60) + ' 分钟前';
+  if (s < 86400) return Math.floor(s/3600) + ' 小时前';
+  return Math.floor(s/86400) + ' 天前';
+}
+function fmtDur(sec) {
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec/60) + 'm' + (sec%60) + 's';
+  return Math.floor(sec/3600) + 'h' + Math.floor((sec%3600)/60) + 'm';
+}
+function api() {
+  return fetch('/admin/api/state' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''))
+    .then(function(r) {
+      if (r.status === 401) { document.getElementById('sub').textContent = 'ADMIN_KEY 无效'; throw new Error('unauthorized'); }
+      return r.json();
+    });
+}
+function badge(state, alive) {
+  var cls = 'b-dim', label = state || 'unknown';
+  if (state === 'ok') cls = 'b-ok';
+  else if (state === 'unknown') cls = 'b-dim';
+  else if (state === 'rate_limited') cls = 'b-warn';
+  else cls = 'b-err';
+  return '<span class="badge ' + cls + '">' + esc(label) + '</span>';
+}
+function delayHtml(d) {
+  if (d == null) return '<span class="delay-none">无数据</span>';
+  var cls = d <= 300 ? 'delay-ok' : (d <= 800 ? 'delay-warn' : 'delay-err');
+  return '<span class="' + cls + '">' + d + ' ms</span>';
+}
+function render(d) {
+  document.getElementById('sub').textContent = 'v' + d.version + ' · ' + d.time;
+  var sm = [
+    '<div class="item"><b>' + d.accounts.length + '</b><span>账号</span></div>',
+    '<div class="item"><b>' + d.stats.totalRequests + '</b><span>请求</span></div>',
+    '<div class="item"><b>' + d.stats.totalErrors + '</b><span>错误</span></div>',
+    '<div class="item"><b>' + fmtDur(d.uptimeSec) + '</b><span>运行时长</span></div>',
+    '<div class="item"><b>' + (d.proxy.enabled ? 'ON' : 'OFF') + '</b><span>代理出口</span></div>'
+  ].join('');
+  document.getElementById('summary').innerHTML = sm;
+  document.getElementById('warn').innerHTML = d.proxy.enabled
+    ? (d.proxy.mihomoApi !== 'ok' ? '<div class="banner">mihomo API 不可达（' + esc(d.proxy.host) + ':9090）—— 区域节点状态可能滞后</div>' : '')
+    : '<div class="banner">代理出口未启用：所有账号共用一个出口 IP，设备画像与 IP 地理不一致，存在关联检测风险</div>';
+  var rg = (d.proxy.regions || []).map(function(r, i) {
+    return '<div class="card" data-region="' + esc(r.code) + '"><div class="head"><div class="title">' + r.flag + ' ' + esc(r.name) + '</div>' + delayHtml(r.delay) + '</div>'
+      + '<div class="row"><span class="k">端口</span><span class="v">:' + r.port + '</span></div>'
+      + '<div class="row"><span class="k">当前节点</span><span class="v" title="' + esc(r.node) + '">' + esc(r.node || '—') + '</span></div>'
+      + '<button class="btn" data-delay="' + esc(r.code) + '">测速</button></div>';
+  }).join('');
+  document.getElementById('regions').innerHTML = rg || '<div class="card"><div class="row"><span class="k">未启用代理</span></div></div>';
+  var ac = (d.accounts || []).map(function(a) {
+    var regionLine = a.region ? (a.region.flag + ' ' + esc(a.region.name) + ' · :' + a.region.port) : '直连';
+    var cd = a.cooldownUntil ? ' · 冷却 ' + fmtDur(Math.ceil((a.cooldownUntil - Date.now())/1000)) : '';
+    var quota = (a.quota || []).map(function(q) {
+      var rem = q.remaining != null ? (q.remaining + '/' + q.limit) : '—';
+      return '<div class="row"><span class="k">' + esc(q.model) + '</span><span class="v">' + rem + '</span></div>';
+    }).join('');
+    return '<div class="card">'
+      + '<div class="head"><div class="title" title="' + esc(a.email) + '">' + esc(a.email) + '</div>' + badge(a.state, a.alive) + '</div>'
+      + '<div class="row"><span class="k">出口区域</span><span class="v">' + regionLine + '</span></div>'
+      + '<div class="row"><span class="k">设备画像</span><span class="v">' + esc(a.device.os) + ' · ' + esc(a.device.timezone) + ' · ' + esc(a.device.locale) + '</span></div>'
+      + '<div class="row"><span class="k">活跃会话</span><span class="v">' + a.activeSessions + '</span></div>'
+      + '<div class="row"><span class="k">请求 / 错误</span><span class="v">' + a.requests + ' / ' + a.errors + cd + '</span></div>'
+      + '<div class="row"><span class="k">最后使用</span><span class="v">' + ago(a.lastUsedAt) + '</span></div>'
+      + (quota ? '<div class="quota">' + quota + '</div>' : '')
+      + '</div>';
+  }).join('');
+  document.getElementById('accounts').innerHTML = ac;
+}
+function tick() { api().then(render).catch(function(){}); }
+tick();
+setInterval(tick, 5000);
+
+// 手动测速：单区域或全部（__all__）。测完后刷新一次面板（延迟数据来自
+// mihomo provider health-check 历史，group/delay 会同时写入）。
+var testing = false;
+var toastTimer = null;
+function toast(msg, kind) {
+  var t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.className = 'toast show toast-' + (kind || 'ok');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function() { t.className = 'toast'; }, 4000);
+}
+function setZap(text, busy) {
+  var z = document.getElementById('testall');
+  if (!z) return;
+  z.textContent = text || '⚡';
+  z.classList.toggle('busy', !!busy);
+}
+function runDelay(code) {
+  if (testing) return;
+  testing = true;
+  var zapMode = code === '__all__';
+  var label = zapMode ? '全部区域' : code;
+  var btns = document.querySelectorAll('button[data-delay]');
+  btns.forEach(function(b) { b.disabled = true; if (!zapMode && b.dataset.delay === code) b.classList.add('testing'); });
+  if (zapMode) setZap('…', true);
+  fetch('/admin/api/delay' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(zapMode ? {} : { region: code })
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var parts = [];
+      var fails = 0;
+      Object.keys(d.results || {}).forEach(function(k) {
+        var v = d.results[k];
+        if (v.ok) parts.push(k + ' ' + (v.nodes > 1 ? v.min + '-' + v.max : (v.min != null ? v.min : '?')) + 'ms');
+        else { fails++; parts.push(k + ' 失败'); }
+      });
+      toast(label + '测速' + (fails ? '：' + (d.results ? Object.keys(d.results).length - fails : 0) + '/' + Object.keys(d.results || {}).length + ' 成功' : '完成') + ' · ' + parts.join('，'), fails ? (Object.keys(d.results || {}).length === fails ? 'err' : 'warn') : 'ok');
+    })
+    .catch(function(e) { toast(label + '测速请求失败：' + String(e), 'err'); })
+    .finally(function() {
+      testing = false;
+      if (zapMode) setZap('⚡', false);
+      btns.forEach(function(b) { b.disabled = false; b.classList.remove('testing'); });
+      tick();
+    });
+}
+document.addEventListener('click', function(ev) {
+  var t = ev.target.closest ? ev.target.closest('button[data-delay]') : null;
+  if (t && !testing) { runDelay(t.dataset.delay); return; }
+  var z = ev.target.closest ? ev.target.closest('#testall') : null;
+  if (z && !testing) runDelay('__all__');
+});
+</script>
+</body>
+</html>`;

@@ -1,0 +1,28 @@
+# freebuff2api 每账号出口路由模板
+# 由 scripts/gen-mihomo-config.mjs 从 .env 读取 SUB_URL / PROXY_REGIONS /
+# PROXY_PORT_BASE 生成 deploy/mihomo/config.yaml；生成的文件含订阅地址，不入库。
+#
+# 结构：订阅经 proxy-provider 导入 → 每个区域一个 url-test 组（自动选延迟最低
+# 节点）→ 每个区域一个独立 HTTP 监听端口。worker.js 按账号哈希绑定区域端口，
+# 同账号永远同一出口 IP。
+mode: rule
+log-level: warning
+external-controller: 0.0.0.0:9090
+
+proxy-providers:
+  westdata:
+    type: http
+    url: "__SUB_URL__"
+    interval: 86400
+    path: ./providers/westdata.yaml
+    health-check:
+      enable: true
+      url: https://www.gstatic.com/generate_204
+      interval: 600
+
+proxy-groups: []
+
+listeners: []
+
+rules:
+  - MATCH,DIRECT
