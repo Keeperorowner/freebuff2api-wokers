@@ -1,7 +1,7 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.10.2";
+const VERSION = "1.8.10.3";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 const SDK_UA = "ai-sdk/openai-compatible/1.0.25/codebuff";
 const DESKTOP_UA = "Freebuff-CLI/0.0.138";
@@ -743,9 +743,10 @@ async function deleteUpstreamSession(token, instanceId) {
 let chainTail = Promise.resolve();
 const CHAIN_GAP_MS = 300; // 上游免费通道并发 >1 会出问题，串行+小间隔；300ms 足够防抖且链路总耗时可控
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+function jitterSleep() { return sleep(CHAIN_GAP_MS + Math.floor(Math.random() * 1200)); }
 
 function enqueue(fn) {
-  const run = chainTail.then(() => sleep(CHAIN_GAP_MS)).then(fn);
+  const run = chainTail.then(() => jitterSleep()).then(fn);
   chainTail = run.catch(() => {});
   return run;
 }
@@ -931,8 +932,6 @@ async function runNormalClientBehavior(token, clientFingerprint) {
 }
 
 async function createSession(token, sessionModel, forceCreate = false) {
-  // 0) 正常客户端行为：广告链 + usage 触碰（30 分钟节流，失败静默）
-  try { await runNormalClientBehavior(token, stableFingerprint(token)); } catch {}
   // 1) 缓存命中且未过期（剩 >60s）直接复用，避免每次请求都打上游 session 接口
   if (!forceCreate) {
     const cached = sessCache.get(token + ":" + sessionModel);
