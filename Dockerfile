@@ -5,8 +5,12 @@ WORKDIR /app
 # 运行时需要的工具：wget 用于启动时拉取最新 worker.js
 RUN apk add --no-cache wget
 
+# 依赖：undici（每账号代理出口的 ProxyAgent）
+COPY package.json ./
+RUN npm install --omit=dev && npm cache clean --force
+
 # 预置当前版本作为本地兜底（启动时若拉取失败仍可运行）
-COPY package.json server.js worker.js ./
+COPY server.js worker.js ./
 
 # 创建引导器：启动时从 GitHub raw 拉取最新 worker.js
 # （fscarmen/Argo-Nezha-Service-Container 模式：容器只做引导，逻辑在远程仓库）
@@ -16,12 +20,12 @@ RUN printf '%s\n' \
     '#!/usr/bin/env sh' \
     '' \
     'set -e' \
-    'WORKER_URL="https://raw.githubusercontent.com/pingmike2/freebuff2api-wokers/main/worker.js"' \
+    'WORKER_URL="https://raw.githubusercontent.com/Keeperorowner/freebuff2api-wokers/main/worker.js"' \
     'TMP="/tmp/worker.js"' \
     '' \
     'echo "[entrypoint] fetching latest worker.js from GitHub..."' \
     'if wget -q --timeout=15 -O "$TMP" "$WORKER_URL"; then' \
-    '  cp "$TMP" /app/worker.js && echo "[entrypoint] worker.js updated"' \
+    '  cp "$TMP" /app/worker.js && echo "[entrypoint] worker.js updated" || echo "[entrypoint] /app/worker.js not writable (bind-mounted), keeping local copy"' \
     'else' \
     '  echo "[entrypoint] fetch failed, keeping bundled worker.js"' \
     'fi' \

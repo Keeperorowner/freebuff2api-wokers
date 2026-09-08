@@ -39,3 +39,13 @@ logs/
 
 # 本地额度验证脚本，仅本地使用
 freebuff_tools/test_extract_freebuff_quota.py
+
+# mihomo 生成的配置含订阅地址，绝不提交
+deploy/mihomo/config.yaml
+deploy/mihomo/providers/
+deploy/mihomo/cache.db
+deploy/mihomo/*.log
+
+# node 依赖
+node_modules/
+package-lock.json

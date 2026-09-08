@@ -1,0 +1,19 @@
+# mihomo 多区域出口容器（在 deploy/mihomo 目录内运行）：
+#   docker compose -f docker-compose.mihomo.yml up -d
+# 配置 = 本目录 config.yaml（gen-mihomo-config.mjs 生成，含防污染 DNS 段）；
+# 整目录读写挂载（mihomo 需要写 geo/cache.db/providers 缓存）。
+# freebuff2api 侧 .env 切换（Docker Desktop 用 host.docker.internal 即可，无需同网络）：
+#   PROXY_HOST=host.docker.internal
+#   PROXY_PORT_BASE=24001
+#   PROXY_REGIONS=<gen 脚本输出的生效区域>
+#   然后 docker compose restart freebuff2api
+services:
+  mihomo:
+    image: metacubex/mihomo:latest
+    container_name: mihomo
+    restart: unless-stopped
+    volumes:
+      - .:/root/.config/mihomo
+    ports:
+      - "9090:9090"        # external-controller（面板/API；worker.js 只读本机 9090）
+      - "24001-24010:24001-24010"   # 每区域一个 HTTP 出口监听

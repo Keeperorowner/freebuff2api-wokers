@@ -1,10 +1,14 @@
 const CODEBUFF_API = "https://www.codebuff.com";
 const DEFAULT_MODEL = "mimo/mimo-v2.5";
 const DEFAULT_API_KEY = "freebuff-default-key";
-const VERSION = "1.8.10.3";
+const VERSION = "1.8.11-nfp5";
 const CONTEXT_PRUNER_AGENT = "context-pruner";
 const SDK_UA = "ai-sdk/openai-compatible/1.0.25/codebuff";
 const DESKTOP_UA = "Freebuff-CLI/0.0.138";
+// 官方 CLI 的非 chat 调用（session/agent-runs/me/usage）都是裸 bun fetch，默认
+// UA = Bun/<version>（对齐 freebuff-proxy 实测：chat 用 ai-sdk UA、其余用 Bun UA，
+// 与官方客户端流量指纹一致，降低被识别为代理脚本的封禁风险）。
+const BUN_UA = "Bun/1.3.14";
 
 // 动态模型注册表：从官方 freebuff 镜像拉取模型清单
 // 真源: https://github.com/CodebuffAI/freebuff (freebuff-private 的 public 镜像)
@@ -198,7 +202,9 @@ async function fetchSourceList(urls) {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
+      // GitHub 源在 CN 网络直连不稳：启用代理时统一走第一个区域出口
+      const d = infraDispatcher();
+      const resp = await fetch(url, { signal: ctrl.signal, ...(d ? { dispatcher: d } : {}) });
       clearTimeout(timer);
       if (resp.ok) {
         const text = await resp.text();
@@ -273,7 +279,8 @@ async function tryReleaseFallback() {
     try {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
-      const resp = await fetch(url, { signal: ctrl.signal });
+      const d = infraDispatcher();
+      const resp = await fetch(url, { signal: ctrl.signal, ...(d ? { dispatcher: d } : {}) });
       clearTimeout(timer);
       if (resp.ok) {
         const json = await resp.json();
@@ -392,6 +399,19 @@ export default {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
 
+    updateRuntimeConfig(env);
+
+    // admin 面板：独立鉴权（ADMIN_KEY），与业务 API key 分离，仅供运维观察
+    if (url.pathname === "/admin" || url.pathname === "/admin/") return handleAdminPage(request, url);
+    if (url.pathname === "/admin/logs" || url.pathname === "/admin/logs/") return handleAdminLogsPage(request, url);
+    if (url.pathname === "/admin/api/state") return handleAdminState(request, env, url);
+    if (url.pathname === "/admin/api/delay") return handleAdminDelay(request, env, url);
+    if (url.pathname === "/admin/api/settings") return handleAdminSettings(request, env, url);
+    if (url.pathname === "/admin/api/accounts/login") return handleAdminAccountLogin(request, env, url);
+    if (url.pathname === "/admin/api/accounts") return handleAdminAccounts(request, env, url);
+    if (url.pathname === "/admin/api/probe") return handleAdminProbe(request, env, url);
+    if (url.pathname === "/admin/api/logs") return handleAdminLogs(request, env, url);
+
     // healthz 不鉴权：健康检查/监控探针不应依赖 API key
     if (request.method === "GET" && url.pathname === "/healthz") {
       // 健康检查只读 Worker 最近一次真实请求形成的本地快照。
@@ -445,6 +465,19 @@ const sessCache = new Map();      // `${token}:${sessionModel}` -> { instanceId,
 
 
 function parseAccounts(env) {
+  // 优先 FREEBUFF_ACCOUNTS（server.js 从 credentials 目录取 [{email, authToken}]），
+  // 供 admin 面板显示账号身份；格式异常时回退 FREEBUFF_TOKEN。
+  if (env.FREEBUFF_ACCOUNTS) {
+    try {
+      const arr = JSON.parse(env.FREEBUFF_ACCOUNTS);
+      if (Array.isArray(arr)) {
+        const out = arr
+          .filter((a) => a && typeof a.authToken === "string" && a.authToken.trim().length > 8)
+          .map((a) => ({ token: a.authToken.trim(), uid: null, email: a.email || null }));
+        if (out.length > 0) return out;
+      }
+    } catch {}
+  }
   // 支持一行一个（换行）或逗号分隔；每项可为纯 token 或 "token:uid"（冒号配对 user_id）
   // 例："t1\nt2:u2\nt3,u4:u4" → [{token:t1,uid:null},{token:t2,uid:u2},...]
   return (env.FREEBUFF_TOKEN || "").split(/[\n,]/)
@@ -533,6 +566,458 @@ function summarizeAccountHealth(pool, health) {
   };
 }
 
+// ---------------------------------------------------------------------------
+// admin 面板（/admin）：账号/出口区域/配额/请求统计。只读本地状态与
+// mihomo API，绝不为面板主动探测上游（避免制造可疑行为）。
+// ---------------------------------------------------------------------------
+const adminStats = { startedAt: Date.now(), totalRequests: 0, totalErrors: 0, lastRequestAt: null };
+const accountStats = new Map(); // token -> { requests, errors, lastUsedAt }
+
+// 请求日志环形缓冲（仅内存，重启清空；不落盘避免写盘放大）
+const adminLogs = [];
+const ADMIN_LOG_MAX = 200;
+function noteLog(entry) {
+  adminLogs.push(entry);
+  if (adminLogs.length > ADMIN_LOG_MAX) adminLogs.shift();
+}
+function accountLabel(env, token) {
+  if (!token) return "—";
+  const acct = parseAccounts(env).find((a) => a.token === token);
+  return acct && acct.email ? acct.email : token.slice(0, 8) + "...";
+}
+
+function noteRequest() {
+  adminStats.totalRequests++;
+  adminStats.lastRequestAt = new Date().toISOString();
+}
+
+function noteAccountUse(token) {
+  let s = accountStats.get(token);
+  if (!s) { s = { requests: 0, errors: 0, lastUsedAt: null }; accountStats.set(token, s); }
+  s.requests++;
+  s.lastUsedAt = Date.now();
+}
+
+function noteAccountError(token) {
+  adminStats.totalErrors++;
+  const s = accountStats.get(token);
+  if (s) s.errors++;
+}
+
+function adminAuthorized(request, url) {
+  if (!RT.adminKey) return true; // 未设 ADMIN_KEY：本地部署默认开放
+  const q = url.searchParams.get("key");
+  if (q && q === RT.adminKey) return true;
+  const auth = request.headers.get("Authorization") || "";
+  return auth === "Bearer " + RT.adminKey;
+}
+
+// mihomo REST API（external-controller :9090）读区域组当前节点与延迟
+async function mihomoRegionStatus() {
+  if (!RT.proxyEnabled || !RT.proxyHost) return null;
+  try {
+    // 组结构在 /proxies，但 provider 节点不在其中——节点延迟历史在
+    // /providers/proxies（health-check 每 10 分钟自动刷新）。
+    // 纯被动读取本地 mihomo 状态，不产生任何外发流量。
+    const [groupsResp, provResp] = await Promise.all([
+      fetch("http://" + RT.proxyHost + ":9090/proxies", { signal: AbortSignal.timeout(3000) }),
+      fetch("http://" + RT.proxyHost + ":9090/providers/proxies", { signal: AbortSignal.timeout(3000) }),
+    ]);
+    if (!groupsResp.ok || !provResp.ok) return null;
+    const groups = await groupsResp.json();
+    const provs = await provResp.json();
+    const nodeDelay = new Map();
+    for (const prov of Object.values(provs.providers || {})) {
+      if (!Array.isArray(prov.proxies)) continue;
+      for (const p of prov.proxies) {
+        const hist = Array.isArray(p.history) && p.history.length ? p.history[p.history.length - 1] : null;
+        if (hist && typeof hist.delay === "number" && hist.delay > 0) nodeDelay.set(p.name, hist.delay);
+      }
+    }
+    const out = {};
+    for (const region of RT.regions) {
+      const g = groups.proxies && groups.proxies["exit-" + region];
+      if (!g || !g.now) { out[region] = null; continue; }
+      out[region] = { node: g.now, delay: nodeDelay.has(g.now) ? nodeDelay.get(g.now) : null };
+    }
+    return out;
+  } catch { return null; }
+}
+
+async function handleAdminState(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  const pool = parseAccounts(env);
+  const mihomo = await mihomoRegionStatus();
+  const regions = RT.regions.map((code, i) => {
+    const meta = REGION_META[code];
+    const m = mihomo ? mihomo[code] : null;
+    return {
+      code, name: meta.name, flag: meta.flag, port: RT.portBase + i,
+      node: m ? m.node : null, delay: m ? m.delay : null,
+    };
+  });
+  const accounts = pool.map((acct) => {
+    const h = acctHealth.get(acct.token) || null;
+    const st = accountStats.get(acct.token) || { requests: 0, errors: 0, lastUsedAt: null };
+    const region = accountRegion(acct.token);
+    const regionIdx = region ? RT.regions.indexOf(region) : -1;
+    const profile = accountDeviceProfile(acct.token);
+    const cdUntil = cooldowns.get(acct.token) || 0;
+    let activeSessions = 0;
+    for (const k of sessCache.keys()) {
+      if (k.startsWith(acct.token + ":") && isUsableSession(sessCache.get(k))) activeSessions++;
+    }
+    const quota = h && h.quota && typeof h.quota === "object"
+      ? Object.entries(h.quota).map(([model, e]) => ({
+          model,
+          limit: e && typeof e.limit === "number" ? e.limit : null,
+          remaining: e && typeof e.limit === "number" && typeof e.recentCount === "number" ? e.limit - e.recentCount : null,
+        }))
+      : [];
+    return {
+      key: acct.token.slice(0, 8),
+      email: acct.email || acct.token.slice(0, 8) + "...",
+      state: h ? h.state : "unknown",
+      alive: h ? h.alive : null,
+      checkedAt: h ? h.checkedAt : null,
+      region: region ? { code: region, name: REGION_META[region].name, flag: REGION_META[region].flag, port: regionIdx >= 0 ? RT.portBase + regionIdx : null } : null,
+      device: profile,
+      quota,
+      cooldownUntil: cdUntil > Date.now() ? cdUntil : null,
+      activeSessions,
+      requests: st.requests,
+      errors: st.errors,
+      lastUsedAt: st.lastUsedAt,
+    };
+  });
+  return jsonResponse({
+    version: VERSION,
+    time: new Date().toISOString(),
+    uptimeSec: Math.floor((Date.now() - adminStats.startedAt) / 1000),
+    proxy: {
+      enabled: RT.proxyEnabled,
+      host: RT.proxyHost,
+      portBase: RT.portBase,
+      mihomoApi: mihomo ? "ok" : "unreachable",
+      regions,
+    },
+    stats: { ...adminStats, accountsTracked: accountStats.size },
+    settings: RT.settings,
+    logs: adminLogs.slice(-ADMIN_LOG_MAX).reverse(),
+    accounts,
+  }, 200);
+}
+
+// 设置读写：GET 返回当前设置；POST {accountStrategy} 运行时切换。
+// 持久化：server.js 注入 __freebuffSettingsWriter（写 settings.json），
+// 下次启动经 ADMIN_SETTINGS env 恢复；CF Workers 无写入器 = 仅内存。
+async function handleAdminSettings(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  if (request.method === "POST") {
+    let body = {};
+    try { body = await request.json(); } catch {}
+    const strat = String(body.accountStrategy || "");
+    if (strat === "sequential" || strat === "round-robin") {
+      RT.settings = { ...RT.settings, accountStrategy: strat };
+      const writer = globalThis.__freebuffSettingsWriter;
+      if (writer) { try { writer(JSON.stringify(RT.settings)); } catch {} }
+      return jsonResponse({ ok: true, settings: RT.settings, persisted: !!writer }, 200);
+    }
+    return jsonResponse({ error: { message: "invalid accountStrategy (round-robin | sequential)" } }, 400);
+  }
+  return jsonResponse({ settings: RT.settings }, 200);
+}
+
+function handleAdminPage(request, url) {
+  if (!adminAuthorized(request, url)) return new Response("invalid admin key", { status: 401 });
+  return new Response(ADMIN_HTML, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache", "Expires": "0" },
+  });
+}
+
+// 日志独立界面（/admin/logs）：单独页面展示完整请求日志，可筛选/导出/清空。
+function handleAdminLogsPage(request, url) {
+  if (!adminAuthorized(request, url)) return new Response("invalid admin key", { status: 401 });
+  return new Response(LOGS_HTML, {
+    status: 200,
+    headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache", "Expires": "0" },
+  });
+}
+
+// 手动延迟测试：POST /admin/api/delay {region:"US"} 或 {} = 全部区域。
+// 通过 mihomo REST API 对指定 exit-<region> 组做 /group/delay（测组内所有
+// 节点，同时刷新 url-test 选点），并把测速结果写回组内每个节点的 history。
+async function handleAdminDelay(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  if (request.method !== "POST") return jsonResponse({ error: { message: "POST only" } }, 405);
+  if (!RT.proxyEnabled || !RT.proxyHost) return jsonResponse({ error: { message: "proxy not enabled" } }, 400);
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const region = typeof body.region === "string" ? body.region.toUpperCase() : null;
+  const targets = region
+    ? RT.regions.filter((r) => r === region)
+    : RT.regions;
+  if (targets.length === 0) return jsonResponse({ error: { message: "unknown region: " + region } }, 400);
+  const testUrl = String(body.url || "https://www.gstatic.com/generate_204");
+  const timeout = Math.min(parseInt(body.timeout || "5000", 10) || 5000, 10000);
+  // 逐组串行测速（mihomo 组内节点本身并行），避免同时打爆订阅节点
+  const results = {};
+  for (const r of targets) {
+    try {
+      const resp = await fetch(
+        "http://" + RT.proxyHost + ":9090/group/" + encodeURIComponent("exit-" + r) + "/delay?url=" + encodeURIComponent(testUrl) + "&timeout=" + timeout,
+        { method: "GET", signal: AbortSignal.timeout(timeout + 8000) },
+      );
+      const data = await resp.json().catch(() => null);
+      if (data && typeof data === "object" && !data.message) {
+        const delays = Object.values(data).filter((v) => typeof v === "number");
+        results[r] = {
+          ok: true, nodes: delays.length,
+          min: delays.length ? Math.min(...delays) : null,
+          max: delays.length ? Math.max(...delays) : null,
+        };
+      } else {
+        results[r] = { ok: false, error: String((data && data.message) || ("HTTP " + resp.status)).slice(0, 120) };
+      }
+    } catch (e) {
+      results[r] = { ok: false, error: String(e.message || e).slice(0, 120) };
+    }
+  }
+  return jsonResponse({ time: new Date().toISOString(), results }, 200);
+}
+
+function findAccountByLabel(pool, label) {
+  if (!label) return null;
+  const l = String(label).trim();
+  const lower = l.toLowerCase();
+  const exact = pool.find((a) => (a.email || "").toLowerCase() === lower);
+  if (exact) return exact;
+  const prefix = l.replace(/\.{2,}$/, "");
+  if (prefix.length >= 8) {
+    const byPrefix = pool.find((a) => a.token.startsWith(prefix));
+    if (byPrefix) return byPrefix;
+  }
+  return null;
+}
+
+// 账号管理：POST {email, authToken} 添加（先经 GET /api/v1/me 验证 token）；
+// DELETE {email} 或 {token 前缀} 删除。持久化经 server.js 注入的
+// __freebuffAccountsMutator（写 credentials/ 目录），env 账号池原地热更新。
+async function handleAdminAccounts(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  const mutator = globalThis.__freebuffAccountsMutator;
+  let body = {};
+  try { body = await request.json(); } catch {}
+  if (request.method === "POST") {
+    const token = String(body.authToken || body.token || "").trim();
+    const email = String(body.email || "").trim();
+    if (token.length <= 8) return jsonResponse({ error: { message: "authToken 无效" } }, 400);
+    if (!email) return jsonResponse({ error: { message: "email 必填" } }, 400);
+    const pool = parseAccounts(env);
+    if (pool.some((a) => a.token === token)) return jsonResponse({ error: { message: "该 token 已存在" } }, 409);
+    if (!mutator) return jsonResponse({ error: { message: "仅 Docker/server.js 部署支持账号管理（CF Workers 请改环境变量）" } }, 501);
+    const me = await enqueueUp("GET", "/api/v1/me", token, undefined, {}, 12000);
+    const d = me.data && typeof me.data === "object" ? me.data : null;
+    const uid = d && (d.id || d.uid) ? String(d.id || d.uid) : null;
+    if (me.status !== 200) {
+      recordAccountObservation(token, me.status, me.data, { uid });
+      const reason = me.status === 401 ? "token 无效或已过期" : "上游返回 HTTP " + me.status;
+      return jsonResponse({ error: { message: "验证失败：" + reason } }, 400);
+    }
+    const r = mutator("add", { email, authToken: token });
+    if (!r || !r.ok) return jsonResponse({ error: { message: (r && r.error) || "写入失败" } }, 500);
+    acctHealth.set(token, {
+      alive: true, state: "ok", uid, quota: null, retryAfterMs: null, checkedAt: Date.now(),
+    });
+    noteLog({ ts: new Date().toISOString(), model: "admin", status: 200, account: email, ms: null, err: "账号添加" });
+    return jsonResponse({ ok: true, email, state: "ok", uid: uid ? uid.slice(0, 8) + "..." : null, accounts: r.accounts }, 200);
+  }
+  if (request.method === "DELETE") {
+    if (!mutator) return jsonResponse({ error: { message: "仅 Docker/server.js 部署支持账号管理（CF Workers 请改环境变量）" } }, 501);
+    const label = String(body.email || body.token || body.authToken || "").trim();
+    if (!label) return jsonResponse({ error: { message: "email 或 token 必填" } }, 400);
+    const pool = parseAccounts(env);
+    const victim = findAccountByLabel(pool, label);
+    if (!victim) return jsonResponse({ error: { message: "账号不存在: " + label } }, 404);
+    const r = mutator("remove", { email: victim.email || label, authToken: victim.token });
+    if (!r || !r.ok) return jsonResponse({ error: { message: (r && r.error) || "删除失败" } }, 500);
+    acctHealth.delete(victim.token);
+    accountStats.delete(victim.token);
+    cooldowns.delete(victim.token);
+    for (const k of [...sessCache.keys()]) {
+      if (k.startsWith(victim.token + ":")) sessCache.delete(k);
+    }
+    noteLog({ ts: new Date().toISOString(), model: "admin", status: 200, account: victim.email || label, ms: null, err: "账号删除" });
+    return jsonResponse({ ok: true, removed: victim.email || victim.token.slice(0, 8) + "...", accounts: r.accounts }, 200);
+  }
+  return jsonResponse({ error: { message: "POST / DELETE only" } }, 405);
+}
+
+// 手动探测：POST /admin/api/probe {email} 单个账号，{} = 全部。
+// 走 GET /api/v1/me（不创建 session、不占额度）刷新存活状态与 uid。
+async function handleAdminProbe(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  if (request.method !== "POST") return jsonResponse({ error: { message: "POST only" } }, 405);
+  let body = {};
+  try { body = await request.json(); } catch {}
+  const pool = parseAccounts(env);
+  let targets = pool;
+  if (body.email || body.token) {
+    const victim = findAccountByLabel(pool, String(body.email || body.token));
+    if (!victim) return jsonResponse({ error: { message: "账号不存在: " + String(body.email || body.token) } }, 404);
+    targets = [victim];
+  }
+  const results = [];
+  for (const acct of targets) {
+    const label = acct.email || acct.token.slice(0, 8) + "...";
+    try {
+      const me = await enqueueUp("GET", "/api/v1/me", acct.token, undefined, {}, 12000);
+      const d = me.data && typeof me.data === "object" ? me.data : null;
+      const uid = d && (d.id || d.uid) ? String(d.id || d.uid) : null;
+      recordAccountObservation(acct.token, me.status, me.data, { uid });
+      const h = acctHealth.get(acct.token) || {};
+      results.push({
+        email: label, status: me.status, state: h.state || "unknown",
+        alive: h.alive === true, uid: uid ? uid.slice(0, 8) + "..." : null,
+      });
+    } catch (e) {
+      results.push({ email: label, status: 0, state: "network_error", alive: false, uid: null, error: String(e && e.message || e).slice(0, 120) });
+    }
+  }
+  return jsonResponse({ time: new Date().toISOString(), results }, 200);
+}
+
+// ---------------------------------------------------------------------------
+// 一键添加账号（官方授权码轮询，流程与 freebuff_tools/extract_freebuff.py /
+// 官方 CLI 完全一致）：
+//   1. POST /admin/api/accounts/login → 生成本地 fingerprintId，
+//      POST /api/auth/cli/code 拿一次性 loginUrl + fingerprintHash + expiresAt
+//   2. 用户在【自己的浏览器】打开 loginUrl 完成 Google/GitHub 登录
+//   3. 前端轮询 GET /admin/api/accounts/login?id=xxx → 服务端 GET /api/auth/cli/status
+//      200+user.authToken = 授权成功 → 直接写 credentials/ 并入账号池（热更新）
+// auth 接口不碰 session（无顶号风险），不进串行队列，但必须带超时——上游挂起时
+// 裸 fetch 会永久泄漏 socket（freebuff-proxy 踩过的坑：前端表现为服务假死）。
+// ---------------------------------------------------------------------------
+const loginFlows = new Map(); // id -> { fp, hash, exp, created }
+const LOGIN_FLOW_TTL_MS = 6 * 60 * 1000; // 官方链接 5 分钟过期，留 1 分钟收尾
+
+function sweepLoginFlows() {
+  const now = Date.now();
+  for (const [id, f] of loginFlows) if (now - f.created > LOGIN_FLOW_TTL_MS) loginFlows.delete(id);
+}
+
+function genFingerprintId() {
+  let rand = "";
+  try { rand = crypto.randomUUID().replace(/-/g, "").slice(0, 8); }
+  catch { rand = Math.random().toString(36).slice(2, 10); }
+  return "codebuff-cli-" + rand;
+}
+
+// undici 的 TypeError: fetch failed 不带任何线索，真实原因在 e.cause
+// （ECONNRESET / ETIMEDOUT / 节点连接失败等）。透出 cause 便于面板排查。
+function describeFetchError(e) {
+  let msg = String(e && e.message || e);
+  if (/fetch failed/i.test(msg) && e && e.cause) {
+    const c = e.cause;
+    msg += "（" + (c.code || c.message || String(c)) + "）";
+  }
+  return msg;
+}
+
+async function authUpstream(method, pathWithQuery, body, timeoutMs = 15000) {
+  const dispatcher = infraDispatcher(); // 复用第一区域出口（US），未启代理则直连
+  const headers = { "User-Agent": BUN_UA, Accept: "application/json" };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  const resp = await fetch(CODEBUFF_API + pathWithQuery, {
+    method,
+    headers,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs),
+    ...(dispatcher ? { dispatcher } : {}),
+  });
+  const text = await resp.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  return { status: resp.status, data };
+}
+
+async function handleAdminAccountLogin(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  sweepLoginFlows();
+  if (request.method === "POST") {
+    try {
+      const fp = genFingerprintId();
+      const r = await authUpstream("POST", "/api/auth/cli/code", { fingerprintId: fp });
+      const d = r.data && typeof r.data === "object" ? r.data : {};
+      if (r.status !== 200 || !d.loginUrl || !d.fingerprintHash) {
+        return jsonResponse({ error: { message: "创建授权流失败：HTTP " + r.status + " " + JSON.stringify(d).slice(0, 200) } }, 502);
+      }
+      const id = (crypto.randomUUID ? crypto.randomUUID() : Date.now() + "-" + Math.random()).slice(0, 36);
+      loginFlows.set(id, { fp, hash: d.fingerprintHash, exp: d.expiresAt, created: Date.now() });
+      noteLog({ ts: new Date().toISOString(), model: "admin", status: 200, account: "—", ms: null, err: "发起一键登录授权" });
+      return jsonResponse({ ok: true, id, loginUrl: d.loginUrl, expiresAt: d.expiresAt }, 200);
+    } catch (e) {
+      return jsonResponse({ error: { message: "创建授权流异常：" + describeFetchError(e).slice(0, 180) } }, 502);
+    }
+  }
+  if (request.method === "GET") {
+    const id = String(url.searchParams.get("id") || "");
+    const flow = loginFlows.get(id);
+    if (!flow) return jsonResponse({ ok: false, done: true, error: "授权流不存在或已过期，请重新发起" }, 404);
+    try {
+      const q = new URLSearchParams({
+        fingerprintId: flow.fp, fingerprintHash: flow.hash, expiresAt: String(flow.exp),
+      });
+      const r = await authUpstream("GET", "/api/auth/cli/status?" + q.toString());
+      const user = r.status === 200 && r.data && r.data.user ? r.data.user : null;
+      if (user && user.authToken) {
+        loginFlows.delete(id);
+        const token = String(user.authToken).trim();
+        const email = String(user.email || "unknown").trim();
+        const pool = parseAccounts(env);
+        if (pool.some((a) => a.token === token)) {
+          return jsonResponse({ ok: true, done: true, exists: true, email }, 200);
+        }
+        const mutator = globalThis.__freebuffAccountsMutator;
+        if (!mutator) {
+          // CF Workers 等无写盘环境：把 token 交回前端，用户走手动添加/环境变量
+          return jsonResponse({ ok: true, done: true, manual: true, email, authToken: token }, 200);
+        }
+        const res = mutator("add", { email, authToken: token });
+        if (!res || !res.ok) return jsonResponse({ ok: false, done: true, error: (res && res.error) || "写入失败" }, 500);
+        const uid = user.id ? String(user.id) : null;
+        acctHealth.set(token, { alive: true, state: "ok", uid, quota: null, retryAfterMs: null, checkedAt: Date.now() });
+        noteLog({ ts: new Date().toISOString(), model: "admin", status: 200, account: email, ms: null, err: "账号添加（一键登录）" });
+        return jsonResponse({ ok: true, done: true, email, accounts: res.accounts, uid: uid ? uid.slice(0, 8) + "..." : null }, 200);
+      }
+      if (r.status === 401) return jsonResponse({ ok: true, done: false }, 200); // 尚未授权
+      if (r.status === 400) {
+        loginFlows.delete(id);
+        return jsonResponse({ ok: false, done: true, error: "授权链接已失效，请重新发起" }, 200);
+      }
+      return jsonResponse({ ok: true, done: false, upstream: r.status }, 200);
+    } catch (e) {
+      // 网络瞬断不结束授权流，前端继续轮询
+      return jsonResponse({ ok: true, done: false, error: "轮询异常：" + describeFetchError(e).slice(0, 150) }, 200);
+    }
+  }
+  return jsonResponse({ error: { message: "POST / GET only" } }, 405);
+}
+
+// 日志独立界面 API：GET 返回全部内存日志；DELETE 清空（重启本身也会清空）。
+async function handleAdminLogs(request, env, url) {
+  if (!adminAuthorized(request, url)) return jsonResponse({ error: { message: "Invalid admin key" } }, 401);
+  if (request.method === "DELETE") {
+    const n = adminLogs.length;
+    adminLogs.length = 0;
+    noteLog({ ts: new Date().toISOString(), model: "admin", status: 200, account: "—", ms: null, err: "日志已清空（清除 " + n + " 条）" });
+    return jsonResponse({ ok: true, cleared: n }, 200);
+  }
+  if (request.method !== "GET") return jsonResponse({ error: { message: "GET / DELETE only" } }, 405);
+  return jsonResponse({ time: new Date().toISOString(), max: ADMIN_LOG_MAX, logs: adminLogs.slice().reverse() }, 200);
+}
+
 function pickToken(env, sessionModel) {
   const pool = parseAccounts(env);
   if (pool.length === 0) return null;
@@ -561,6 +1046,17 @@ function pickToken(env, sessionModel) {
       if (isUsableSession(cached)) {
         return acct;
       }
+    }
+  }
+
+  // 顺序优先（sequential）：不轮询。始终用列表中第一个可用号，直到它
+  // 额度耗尽/冷却/失效才前进到下一个。配合「每号同时仅一个会话」的
+  // upstream 约束（sessCache 按 token+model 单条缓存），行为最贴近单个
+  // 真实用户顺序用号。
+  if (RT.settings.accountStrategy === "sequential") {
+    for (const acct of finalPool) {
+      const t = acct.token;
+      if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
     }
   }
 
@@ -741,7 +1237,9 @@ async function deleteUpstreamSession(token, instanceId) {
 // ---------------------------------------------------------------------------
 
 let chainTail = Promise.resolve();
-const CHAIN_GAP_MS = 300; // 上游免费通道并发 >1 会出问题，串行+小间隔；300ms 足够防抖且链路总耗时可控
+// 上游免费通道并发 >1 会出问题，串行+小间隔防抖。间隔带随机抖动：
+// 固定 300ms 节律在服务端是明显的机器特征。
+const CHAIN_GAP_MS = 300;
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 function jitterSleep() { return sleep(CHAIN_GAP_MS + Math.floor(Math.random() * 1200)); }
 
@@ -760,17 +1258,25 @@ const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
   const headers = {};
-  // 桌面版协议：所有请求带 SDK User-Agent（free 模式识别依赖此 UA）
-  headers["User-Agent"] = SDK_UA;
-  if (token) headers.Authorization = `Bearer ${token}`;
+  // 非 chat 上游调用（session/agent-runs/me/usage/ads）UA 对齐官方裸 bun fetch；
+  // chat 流量走独立 fetch（UA 用 SDK_UA），与此区分。
+  headers["User-Agent"] = BUN_UA;
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+    // 官方桌面/CLI 登录签发的 token 双认证头（freebuff-proxy 实测仅 Bearer 会 401）
+    headers["x-codebuff-api-key"] = token;
+  }
   if (body !== undefined) headers["Content-Type"] = "application/json";
   Object.assign(headers, extraHeaders);
 
+  // 每账号出口：经绑定的 mihomo 区域端口（未启用代理时为 undefined，直连）
+  const dispatcher = token ? proxyDispatcherFor(token) : undefined;
   const resp = await fetch(CODEBUFF_API + path, {
     method,
     headers,
     body: body !== undefined ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(timeoutMs),
+    ...(dispatcher ? { dispatcher } : {}),
   });
   const text = await resp.text();
   let data = null;
@@ -897,6 +1403,295 @@ function stableFingerprint(token) {
   return "enhanced-" + h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
 }
 
+// 设备画像：os 全局池；timezone/locale 优先从账号绑定的出口区域本地池派生
+// （geo 一致性：出口 IP 地理位置、时区、语言三者互证），未启用代理时回退全局混合池。
+const DEVICE_OS_POOL = ["macos", "windows", "linux"];
+// 代理未启用时的回退池（原自由混合分布）
+const FALLBACK_DEVICE_POOL = [
+  { timezone: "America/New_York", locale: "en-US" },
+  { timezone: "America/Chicago", locale: "en-US" },
+  { timezone: "America/Denver", locale: "en-US" },
+  { timezone: "America/Los_Angeles", locale: "en-US" },
+  { timezone: "America/Toronto", locale: "en-CA" },
+  { timezone: "America/Vancouver", locale: "en-CA" },
+  { timezone: "Europe/London", locale: "en-GB" },
+  { timezone: "Europe/Dublin", locale: "en-IE" },
+  { timezone: "Australia/Sydney", locale: "en-AU" },
+  { timezone: "Australia/Melbourne", locale: "en-AU" },
+  { timezone: "Pacific/Auckland", locale: "en-NZ" },
+  { timezone: "Europe/Oslo", locale: "nb-NO" },
+  { timezone: "Europe/Oslo", locale: "en-US" },
+  { timezone: "Europe/Stockholm", locale: "sv-SE" },
+  { timezone: "Europe/Stockholm", locale: "en-US" },
+  { timezone: "Europe/Amsterdam", locale: "nl-NL" },
+  { timezone: "Europe/Amsterdam", locale: "en-US" },
+  { timezone: "Europe/Copenhagen", locale: "da-DK" },
+  { timezone: "Europe/Copenhagen", locale: "en-US" },
+  { timezone: "Europe/Helsinki", locale: "fi-FI" },
+  { timezone: "Europe/Helsinki", locale: "en-US" },
+  { timezone: "Atlantic/Reykjavik", locale: "is-IS" },
+  { timezone: "Atlantic/Reykjavik", locale: "en-US" },
+  { timezone: "Europe/Berlin", locale: "de-DE" },
+  { timezone: "Europe/Berlin", locale: "en-US" },
+  { timezone: "Europe/Vienna", locale: "de-AT" },
+  { timezone: "Europe/Vienna", locale: "en-US" },
+  { timezone: "Europe/Zurich", locale: "de-CH" },
+  { timezone: "Europe/Zurich", locale: "en-US" },
+  { timezone: "Europe/Vaduz", locale: "de-LI" },
+  { timezone: "Europe/Vaduz", locale: "en-US" },
+  { timezone: "Europe/Paris", locale: "fr-FR" },
+  { timezone: "Europe/Paris", locale: "en-US" },
+  { timezone: "Europe/Luxembourg", locale: "fr-LU" },
+  { timezone: "Europe/Luxembourg", locale: "en-US" },
+  { timezone: "Europe/Brussels", locale: "nl-BE" },
+  { timezone: "Europe/Brussels", locale: "fr-BE" },
+  { timezone: "Europe/Brussels", locale: "en-US" },
+  { timezone: "Europe/Rome", locale: "it-IT" },
+  { timezone: "Europe/Rome", locale: "en-US" },
+  { timezone: "Europe/Madrid", locale: "es-ES" },
+  { timezone: "Europe/Madrid", locale: "en-US" },
+  { timezone: "Europe/Lisbon", locale: "pt-PT" },
+  { timezone: "Europe/Lisbon", locale: "en-US" },
+  { timezone: "Europe/Malta", locale: "en-MT" },
+  { timezone: "Europe/Malta", locale: "mt-MT" },
+  { timezone: "Asia/Singapore", locale: "en-SG" },
+  { timezone: "Asia/Singapore", locale: "zh-SG" },
+  { timezone: "Asia/Jerusalem", locale: "he-IL" },
+  { timezone: "Asia/Jerusalem", locale: "en-US" },
+];
+
+// FNV-1a 带 salt：同一 token 在不同池上得到互不相关的索引
+function hashPick(input, salt, pool) {
+  let h = (0x811c9dc5 ^ salt) >>> 0;
+  const s = salt + ":" + input;
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(h ^ s.charCodeAt(i), 0x01000193) >>> 0;
+  }
+  return pool[h % pool.length];
+}
+
+// ---------------------------------------------------------------------------
+// 出口区域与代理路由（Docker 部署 + mihomo 多监听端口）：
+// 每个账号按 token 确定性绑定一个区域（PROXY_REGIONS 顺序 + FNV 哈希），
+// 该账号所有上游请求经 mihomo 对应端口（PROXY_PORT_BASE + 区域序号）出走。
+// 出口 IP 稳定（同号永远同区域），且与设备画像地理一致（IP/时区/语言互证）。
+// dispatcher 由 server.js 注入的 globalThis.__freebuffProxyAgentFactory 创建；
+// Cloudflare Workers 下工厂不存在，自动回退直连。
+// ---------------------------------------------------------------------------
+// 区域表 = freebuff 官方支持的国家/地区（服务可用区域）：
+// 出口只走这些区域，避免 country_blocked；HK/TW/JP/KR 等不在支持列表，不设出口。
+const REGION_META = {
+  US: { name: "United States", flag: "🇺🇸", device: [
+    { timezone: "America/New_York", locale: "en-US" },
+    { timezone: "America/Chicago", locale: "en-US" },
+    { timezone: "America/Denver", locale: "en-US" },
+    { timezone: "America/Los_Angeles", locale: "en-US" },
+    { timezone: "America/Phoenix", locale: "en-US" },
+  ] },
+  CA: { name: "Canada", flag: "🇨🇦", device: [
+    { timezone: "America/Toronto", locale: "en-CA" },
+    { timezone: "America/Vancouver", locale: "en-CA" },
+    { timezone: "America/Toronto", locale: "en-US" },
+  ] },
+  UK: { name: "United Kingdom", flag: "🇬🇧", device: [
+    { timezone: "Europe/London", locale: "en-GB" },
+    { timezone: "Europe/London", locale: "en-GB" },
+    { timezone: "Europe/London", locale: "en-US" },
+  ] },
+  AU: { name: "Australia", flag: "🇦🇺", device: [
+    { timezone: "Australia/Sydney", locale: "en-AU" },
+    { timezone: "Australia/Melbourne", locale: "en-AU" },
+    { timezone: "Australia/Perth", locale: "en-AU" },
+  ] },
+  NZ: { name: "New Zealand", flag: "🇳🇿", device: [
+    { timezone: "Pacific/Auckland", locale: "en-NZ" },
+    { timezone: "Pacific/Auckland", locale: "en-NZ" },
+    { timezone: "Pacific/Auckland", locale: "en-US" },
+  ] },
+  NO: { name: "Norway", flag: "🇳🇴", device: [
+    { timezone: "Europe/Oslo", locale: "nb-NO" },
+    { timezone: "Europe/Oslo", locale: "nb-NO" },
+    { timezone: "Europe/Oslo", locale: "en-US" },
+  ] },
+  SE: { name: "Sweden", flag: "🇸🇪", device: [
+    { timezone: "Europe/Stockholm", locale: "sv-SE" },
+    { timezone: "Europe/Stockholm", locale: "sv-SE" },
+    { timezone: "Europe/Stockholm", locale: "en-US" },
+  ] },
+  NL: { name: "Netherlands", flag: "🇳🇱", device: [
+    { timezone: "Europe/Amsterdam", locale: "nl-NL" },
+    { timezone: "Europe/Amsterdam", locale: "nl-NL" },
+    { timezone: "Europe/Amsterdam", locale: "en-US" },
+  ] },
+  DK: { name: "Denmark", flag: "🇩🇰", device: [
+    { timezone: "Europe/Copenhagen", locale: "da-DK" },
+    { timezone: "Europe/Copenhagen", locale: "da-DK" },
+    { timezone: "Europe/Copenhagen", locale: "en-US" },
+  ] },
+  DE: { name: "Germany", flag: "🇩🇪", device: [
+    { timezone: "Europe/Berlin", locale: "de-DE" },
+    { timezone: "Europe/Berlin", locale: "de-DE" },
+    { timezone: "Europe/Berlin", locale: "en-US" },
+  ] },
+  FR: { name: "France", flag: "🇫🇷", device: [
+    { timezone: "Europe/Paris", locale: "fr-FR" },
+    { timezone: "Europe/Paris", locale: "fr-FR" },
+    { timezone: "Europe/Paris", locale: "en-US" },
+  ] },
+  IT: { name: "Italy", flag: "🇮🇹", device: [
+    { timezone: "Europe/Rome", locale: "it-IT" },
+    { timezone: "Europe/Rome", locale: "it-IT" },
+    { timezone: "Europe/Rome", locale: "en-US" },
+  ] },
+  ES: { name: "Spain", flag: "🇪🇸", device: [
+    { timezone: "Europe/Madrid", locale: "es-ES" },
+    { timezone: "Europe/Madrid", locale: "es-ES" },
+    { timezone: "Europe/Madrid", locale: "en-US" },
+  ] },
+  PT: { name: "Portugal", flag: "🇵🇹", device: [
+    { timezone: "Europe/Lisbon", locale: "pt-PT" },
+    { timezone: "Europe/Lisbon", locale: "pt-PT" },
+    { timezone: "Europe/Lisbon", locale: "en-US" },
+  ] },
+  FI: { name: "Finland", flag: "🇫🇮", device: [
+    { timezone: "Europe/Helsinki", locale: "fi-FI" },
+    { timezone: "Europe/Helsinki", locale: "fi-FI" },
+    { timezone: "Europe/Helsinki", locale: "en-US" },
+  ] },
+  BE: { name: "Belgium", flag: "🇧🇪", device: [
+    { timezone: "Europe/Brussels", locale: "nl-BE" },
+    { timezone: "Europe/Brussels", locale: "fr-BE" },
+    { timezone: "Europe/Brussels", locale: "en-US" },
+  ] },
+  LU: { name: "Luxembourg", flag: "🇱🇺", device: [
+    { timezone: "Europe/Luxembourg", locale: "fr-LU" },
+    { timezone: "Europe/Luxembourg", locale: "fr-LU" },
+    { timezone: "Europe/Luxembourg", locale: "en-US" },
+  ] },
+  LI: { name: "Liechtenstein", flag: "🇱🇮", device: [
+    { timezone: "Europe/Vaduz", locale: "de-LI" },
+    { timezone: "Europe/Vaduz", locale: "de-LI" },
+    { timezone: "Europe/Vaduz", locale: "en-US" },
+  ] },
+  CH: { name: "Switzerland", flag: "🇨🇭", device: [
+    { timezone: "Europe/Zurich", locale: "de-CH" },
+    { timezone: "Europe/Zurich", locale: "de-CH" },
+    { timezone: "Europe/Zurich", locale: "en-US" },
+  ] },
+  AT: { name: "Austria", flag: "🇦🇹", device: [
+    { timezone: "Europe/Vienna", locale: "de-AT" },
+    { timezone: "Europe/Vienna", locale: "de-AT" },
+    { timezone: "Europe/Vienna", locale: "en-US" },
+  ] },
+  SG: { name: "Singapore", flag: "🇸🇬", device: [
+    { timezone: "Asia/Singapore", locale: "en-SG" },
+    { timezone: "Asia/Singapore", locale: "en-SG" },
+    { timezone: "Asia/Singapore", locale: "zh-SG" },
+  ] },
+  MT: { name: "Malta", flag: "🇲🇹", device: [
+    { timezone: "Europe/Malta", locale: "en-MT" },
+    { timezone: "Europe/Malta", locale: "en-MT" },
+    { timezone: "Europe/Malta", locale: "mt-MT" },
+  ] },
+  IL: { name: "Israel", flag: "🇮🇱", device: [
+    { timezone: "Asia/Jerusalem", locale: "he-IL" },
+    { timezone: "Asia/Jerusalem", locale: "he-IL" },
+    { timezone: "Asia/Jerusalem", locale: "en-US" },
+  ] },
+  IE: { name: "Ireland", flag: "🇮🇪", device: [
+    { timezone: "Europe/Dublin", locale: "en-IE" },
+    { timezone: "Europe/Dublin", locale: "en-IE" },
+    { timezone: "Europe/Dublin", locale: "en-US" },
+  ] },
+  IS: { name: "Iceland", flag: "🇮🇸", device: [
+    { timezone: "Atlantic/Reykjavik", locale: "is-IS" },
+    { timezone: "Atlantic/Reykjavik", locale: "is-IS" },
+    { timezone: "Atlantic/Reykjavik", locale: "en-US" },
+  ] },
+};
+// 默认 = freebuff 支持区域全集；实际生效列表由部署 .env 的 PROXY_REGIONS 提供
+// （gen-mihomo-config.mjs 按「订阅里真实存在的节点」收敛后写回）
+const DEFAULT_REGIONS = "US,CA,UK,AU,NZ,NO,SE,NL,DK,DE,FR,IT,ES,PT,FI,BE,LU,LI,CH,AT,SG,MT,IL,IE,IS";
+
+let RT = {
+  proxyEnabled: false, proxyHost: "", portBase: 24001, regions: [], adminKey: "",
+  // settings 可经 /admin/api/settings 运行时修改；server.js 注入持久化副本
+  settings: { accountStrategy: "round-robin" }, // round-robin | sequential
+};
+let rtSettingsInit = false; // env 默认只在首次初始化生效；运行时改动（POST /admin/api/settings）跨请求保留
+function updateRuntimeConfig(env) {
+  const regions = String(env.PROXY_REGIONS || DEFAULT_REGIONS)
+    .split(",").map((s) => s.trim().toUpperCase()).filter((c) => REGION_META[c]);
+  const enableFlag = String(env.PROXY_ENABLED || "").trim().toLowerCase();
+  let settings = RT.settings || { accountStrategy: "round-robin" };
+  if (!rtSettingsInit) {
+    rtSettingsInit = true;
+    if (env.ADMIN_SETTINGS) {
+      try {
+        const s = JSON.parse(env.ADMIN_SETTINGS);
+        if (s && (s.accountStrategy === "sequential" || s.accountStrategy === "round-robin")) {
+          settings = { ...settings, accountStrategy: s.accountStrategy };
+        }
+      } catch {}
+    }
+  }
+  RT = {
+    proxyEnabled: enableFlag === "1" || enableFlag === "true",
+    proxyHost: String(env.PROXY_HOST || "mihomo"),
+    portBase: parseInt(env.PROXY_PORT_BASE || "24001", 10) || 24001,
+    regions,
+    adminKey: String(env.ADMIN_KEY || ""),
+    settings,
+  };
+}
+
+function accountRegion(token) {
+  if (!RT.proxyEnabled || RT.regions.length === 0) return null;
+  return hashPick(token, 0x51ed, RT.regions);
+}
+
+const proxyAgents = new Map(); // 端口 -> ProxyAgent 实例（跨请求复用连接池）
+function proxyDispatcherFor(token) {
+  if (!RT.proxyEnabled || !token) return undefined;
+  const factory = globalThis.__freebuffProxyAgentFactory;
+  if (!factory) return undefined;
+  const region = accountRegion(token);
+  const idx = region ? RT.regions.indexOf(region) : -1;
+  if (idx < 0) return undefined;
+  const port = RT.portBase + idx;
+  let agent = proxyAgents.get(port);
+  if (!agent) {
+    agent = factory("http://" + RT.proxyHost + ":" + port);
+    proxyAgents.set(port, agent);
+  }
+  return agent;
+}
+
+// 非账号流量（GitHub 模型源等）共用第一个区域的出口
+function infraDispatcher() {
+  if (!RT.proxyEnabled || RT.regions.length === 0) return undefined;
+  const factory = globalThis.__freebuffProxyAgentFactory;
+  if (!factory) return undefined;
+  const port = RT.portBase;
+  let agent = proxyAgents.get(port);
+  if (!agent) {
+    agent = factory("http://" + RT.proxyHost + ":" + port);
+    proxyAgents.set(port, agent);
+  }
+  return agent;
+}
+
+function accountDeviceProfile(token) {
+  const region = accountRegion(token);
+  const pool = region && REGION_META[region] ? REGION_META[region].device : FALLBACK_DEVICE_POOL;
+  const tzLocale = hashPick(token, 0x9e37, pool);
+  return {
+    os: hashPick(token, 0x85eb, DEVICE_OS_POOL),
+    timezone: tzLocale.timezone,
+    locale: tzLocale.locale,
+  };
+}
+
 // 广告链：POST /ads 拉取 → 若有 impUrl 则 POST /ads/impression 上报曝光。
 // 官方实现：getCliAdRequestUserAgent 发 Freebuff-CLI/<version> UA；
 // body {provider:"gravity", surface, sessionId, device, userAgent}；曝光 {impUrl, mode}
@@ -909,11 +1704,13 @@ async function runNormalClientBehavior(token, clientFingerprint) {
         provider: "gravity",
         sessionId: crypto.randomUUID(),
         surface: "waiting_room",
-        device: { os: "macos", timezone: "Asia/Shanghai", locale: "zh-CN" },
+        device: accountDeviceProfile(token),
         userAgent: DESKTOP_UA,
       }, { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
       const impUrl = ad.data && Array.isArray(ad.data.ads) && ad.data.ads[0] && ad.data.ads[0].impUrl;
       if (ad.status === 200 && impUrl) {
+        // 广告"浏览"时长：真实客户端从拉到广告到上报曝光有 1-3s 展示间隔
+        await sleep(900 + Math.floor(Math.random() * 2400));
         await enqueueUp("POST", "/api/v1/ads/impression", token,
           { impUrl, mode: "free" },
           { "User-Agent": DESKTOP_UA, "Content-Type": "application/json" }, 6000);
@@ -1141,10 +1938,27 @@ function normalizeReasoningEffort(model, effort) {
 function buildUpstreamPayload(params, mc, sess, runId) {
   const payload = {};
   for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
-  // reasoning_effort 按官方模型 efforts 表 clamp-down（不拒绝、不换模型）
-  if (payload.reasoning_effort !== undefined) {
-    payload.reasoning_effort = normalizeReasoningEffort(mc.id, payload.reasoning_effort);
+  // 思维强度归一化（借鉴 freebuff-proxy normalizeReasoningFields）：客户端可能用
+  // 顶层 reasoning_effort（OpenAI 风格）或嵌套 reasoning.effort（新 SDK 风格），
+  // 上游对「两字段并存且取值不同」直接 400，且会替目录模型注入默认 effort 与
+  // 裸 reasoning_effort 冲突。统一收敛为单字段（本 worker 历史上游只吃顶层
+  // reasoning_effort），再按官方模型 efforts 表 clamp-down（不拒绝、不换模型）。
+  const nestedEffort = params.reasoning && typeof params.reasoning === "object"
+    && typeof params.reasoning.effort === "string" ? params.reasoning.effort : null;
+  const effortInput = payload.reasoning_effort != null ? payload.reasoning_effort : nestedEffort;
+  if (effortInput != null) {
+    payload.reasoning_effort = normalizeReasoningEffort(mc.id, effortInput);
   }
+  // 输出预算治理（借鉴 freebuff-proxy normalizeOutputBudget）：DeepSeek 系把
+  // reasoning token 计入输出预算，客户端常带偏小的 max_tokens（如 8192），思考链
+  // 稍长即 finish_reason=length 截断。转发前统一收敛为 max_completion_tokens
+  // 单字段并抬到 floor，避免双字段语义冲突与思考截断。
+  const caps = [payload.max_tokens, payload.max_completion_tokens, params.max_output_tokens]
+    .map((v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0));
+  const clientCap = caps.length ? Math.max(...caps) : 0;
+  delete payload.max_tokens;
+  delete payload.max_output_tokens;
+  payload.max_completion_tokens = Math.max(65536, clientCap);
   payload.model = mc.upstream;
   payload.messages = normalizeMessages(params.messages);
   payload.stream = true;
@@ -1356,6 +2170,12 @@ function responsesInputToMessages(input, instructions) {
 // 这是 reviewer-only 入口：创建 root run 作为父链，再创建 code-reviewer 子 run，
 // 不执行普通 root chat，也不把 reviewer agent 混入普通模型路由。
 async function executeCodeReview(env, chatParams, mc, isStream, mode) {
+  noteRequest();
+  const t0 = Date.now();
+  const emitLog = (status, tok, err, stream) => noteLog({
+    ts: Date.now(), model: mc.id, account: accountLabel(env, tok),
+    status, ms: Date.now() - t0, stream: !!stream, err: err || null,
+  });
   const debug = env.FREEBUFF_DEBUG === "true";
   const reviewerAgent = mc.reviewer_agent;
   const reviewerModel = mc.upstream;
@@ -1378,6 +2198,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
+    noteAccountUse(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     let rootRunId = null;
@@ -1393,14 +2214,18 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
       const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId);
       const headers = {
         Authorization: "Bearer " + token,
+        "x-codebuff-api-key": token,
         "Content-Type": "application/json",
+        "User-Agent": SDK_UA,
         "x-freebuff-instance-id": sess.instanceId,
       };
+      const dispatcher = proxyDispatcherFor(token);
       const resp = await fetch(CODEBUFF_API + "/api/v1/chat/completions", {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
         signal: isStream ? undefined : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+        ...(dispatcher ? { dispatcher } : {}),
       });
       if (!resp.ok) {
         const text = await resp.text();
@@ -1422,6 +2247,7 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         const { readable, writable } = new TransformStream();
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalize);
         else pipeUpstreamToClient(resp.body, writable, finalize);
+        emitLog(200, token, null, true);
         return new Response(readable, {
           status: 200,
           headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
@@ -1432,25 +2258,35 @@ async function executeCodeReview(env, chatParams, mc, isStream, mode) {
         ? await responsesToNonStream(resp.body, mc)
         : await streamToNonStream(resp.body, reviewerModel);
       await finalize();
+      emitLog(200, token);
       return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
     } catch (e) {
       console.error("[code_review]", e);
+      noteAccountError(token);
       // 官方下线模型：全局失败，立即返回，不换号。
       if (e instanceof ModelUnavailableError) {
+        emitLog(400, token, "model unavailable: " + e.modelId);
         return jsonResponse({ error: { message: "Model not available upstream: " + e.modelId + "（官方已下线/暂停该模型）", type: "unsupported_model" } }, 400);
       }
-      lastErrMsg = String(e.message || e);
+      lastErrMsg = describeFetchError(e);
       if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
       if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
       if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
     }
   }
+  emitLog(502, null, lastErrMsg || "code reviewer failed");
   return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
 }
 
 // chat completions 与 responses 共用的上游执行：多号重试 + session/run 生命周期 + 流式/非流式出口
 async function executeChat(env, chatParams, mc, isStream, mode) {
   if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
+  noteRequest();
+  const t0 = Date.now();
+  const emitLog = (status, tok, err, stream) => noteLog({
+    ts: Date.now(), model: mc.id, account: accountLabel(env, tok),
+    status, ms: Date.now() - t0, stream: !!stream, err: err || null,
+  });
   const debug = env.FREEBUFF_DEBUG === "true";
   const pool = parseAccounts(env);
   if (pool.length === 0) return jsonResponse({ error: { message: "缺少 FREEBUFF_TOKEN 环境变量", type: "config_error" } }, 503);
@@ -1462,6 +2298,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
     const acct = pickToken(env, mc.session);
     const token = acct ? acct.token : null;
     if (!token) break;
+    noteAccountUse(token);
     logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
       isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
     try {
@@ -1476,11 +2313,15 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       // 3) chat（428 waiting_room_required / 409 session_superseded = session 失效，
       //    清缓存强制重建后重试一次；仍失败则冷却该号交给外层换号）
       let resp, errText = "", sessForChat = sess;
+      const dispatcher = proxyDispatcherFor(token);
       for (let attempt = 0; attempt < 2; attempt++) {
         const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
         const headers = {
           Authorization: "Bearer " + token,
+          "x-codebuff-api-key": token,
           "Content-Type": "application/json",
+          // chat 流量 UA = 官方 ai-sdk 标识（free 模式识别依赖），非 chat 用 Bun UA
+          "User-Agent": SDK_UA,
           "x-freebuff-instance-id": sessForChat.instanceId,
         };
         // x-freebuff-acting-user-id：⚠️ 实测（2026-08-10）不带它 chat 才能过（200），
@@ -1492,6 +2333,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
         const chatInit = {
           method: "POST", headers, body: JSON.stringify(payload),
+          ...(dispatcher ? { dispatcher } : {}),
         };
         try {
           resp = isStream
@@ -1527,8 +2369,18 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         // 都说明缓存 instance 已失效 → 清缓存强制重建后重试一次；不是限流，不计冷却
         const staleSession =
           isStaleSessionGate(resp.status, errText) ||
-          // Older upstream wrappers returned model mismatch as HTTP 502.
+          // Older upstream returned model mismatch as HTTP 502.
           (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
+        // free_mode_capacity_deferred（"Free mode is briefly at capacity"）= 免费模式
+        // 瞬时容量排队（借鉴 freebuff-proxy）：上游明示会自动重试，实测同 session 立即
+        // 重试即恢复。绝不冷却/换号/新建 session（白烧额度并把好账号钉死）。
+        const capacityDeferred = errText.includes("free_mode_capacity_deferred")
+          || /briefly at capacity/i.test(errText);
+        if (capacityDeferred && attempt === 0) {
+          if (debug) console.log(`[acct ${acctTry + 1}][chat] capacity deferred, same-session retry`);
+          await new Promise((r) => setTimeout(r, 2000));
+          continue;
+        }
         if (staleSession && attempt === 0) {
           await deleteUpstreamSession(token, sessForChat.instanceId);
           if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
@@ -1537,7 +2389,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         }
         // 重建后仍失败：该号 session 状态异常，冷却交给外层换号
         if (staleSession) cooldown(token, 60 * 1000);
-        cooldown(token, parseCooldown(errText, resp.status));
+        if (!capacityDeferred) cooldown(token, parseCooldown(errText, resp.status));
         break;
       }
       if (!resp.ok) {
@@ -1550,18 +2402,23 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         const { readable, writable } = new TransformStream();
         if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
         else pipeUpstreamToClient(resp.body, writable);
+        emitLog(200, token, null, true);
         return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
       }
 
-      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
+      if (mode === "responses") { emitLog(200, token); return jsonResponse(await responsesToNonStream(resp.body, mc), 200); }
 
       const agg = await streamToNonStream(resp.body, mc.upstream);
+      emitLog(200, token);
       return jsonResponse(agg, 200);
     } catch (e) {
       console.error("[" + mode + "]", e);
-      const msg = String(e.message || e);
+      noteAccountError(token);
+      // fetch failed 等裸错误透出底层原因（cause），否则日志里只有无意义的字样
+      const msg = describeFetchError(e);
       // 官方下线模型：全局失败，立即向客户端返回明确错误，不换号、不计冷却。
       if (e instanceof ModelUnavailableError) {
+        emitLog(400, token, "model unavailable: " + e.modelId);
         return jsonResponse({ error: { message: "Model not available upstream: " + e.modelId + "（官方已下线/暂停该模型）", type: "unsupported_model" } }, 400);
       }
       // 额度探测确认耗尽：清除当前模型 session，按上游 retryAfterMs 冷却后切号。
@@ -1574,7 +2431,10 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       }
       // 其他上游交互失败/超时继续沿用原有冷却逻辑；流式 chat 不再因固定 20s abort 进入这里。
       // createSession 429（额度耗尽）按 retryAfterMs/文本冷却，不能固定 60s。
-      if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
+      // free_mode_capacity_deferred 命中 createSession 时只轻冷却 5s（瞬时容量，不钉死账号）。
+      if (/free_mode_capacity_deferred|briefly at capacity/i.test(msg)) {
+        cooldown(token, 5 * 1000);
+      } else if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
         const m429 = msg.match(/429/);
         cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
       }
@@ -1582,6 +2442,7 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
       if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
     }
   }
+  emitLog(502, null, lastErrMsg || "all accounts failed");
   return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
 }
 
@@ -2208,3 +3069,620 @@ function corsHeaders() {
     "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-freebuff-instance-id, anthropic-version, anthropic-beta",
   };
 }
+
+// ---------------------------------------------------------------------------
+// admin 面板 HTML（单文件、零依赖、暗色主题，5s 轮询本地状态 API）
+// ---------------------------------------------------------------------------
+const ADMIN_HTML = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>freebuff2api · admin</title>
+<style>
+  :root { --bg:#0e1116; --card:#161b23; --border:#232b37; --text:#d7dde6; --dim:#8b95a5; --accent:#4f8cff; --ok:#34d399; --warn:#fbbf24; --err:#f87171; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:var(--bg); color:var(--text); font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif; padding:24px; }
+  h1 { font-size:18px; margin-bottom:4px; }
+  h2 { font-size:14px; color:var(--dim); margin:28px 0 12px; text-transform:uppercase; letter-spacing:.08em; }
+  header .sub { color:var(--dim); font-size:12px; }
+  .summary { display:flex; gap:16px; flex-wrap:wrap; margin-top:12px; }
+  .summary .item { background:var(--card); border:1px solid var(--border); border-radius:10px; padding:10px 16px; min-width:120px; }
+  .summary .item b { display:block; font-size:20px; font-weight:600; }
+  .summary .item span { color:var(--dim); font-size:12px; }
+  .banner { background:#2b2313; border:1px solid #6b5416; color:var(--warn); border-radius:10px; padding:10px 14px; margin-top:14px; font-size:13px; }
+  .toast { position:fixed; left:50%; bottom:28px; transform:translateX(-50%); max-width:90vw; padding:10px 18px; border-radius:10px; font-size:13px; border:1px solid; box-shadow:0 4px 16px rgba(0,0,0,.4); opacity:0; pointer-events:none; transition:opacity .25s; z-index:9; }
+  .toast.show { opacity:1; }
+  .toast-ok { background:#0f2318; border-color:var(--ok); color:var(--ok); }
+  .toast-err { background:#2b1313; border-color:var(--err); color:var(--err); }
+  .toast-warn { background:#2b2313; border-color:var(--warn); color:var(--warn); }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:12px; }
+  .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+  .card .head { display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:10px; }
+  .card .head .title { font-weight:600; font-size:14px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:99px; border:1px solid; white-space:nowrap; }
+  .b-ok { color:var(--ok); border-color:var(--ok); background:rgba(52,211,153,.08); }
+  .b-err { color:var(--err); border-color:var(--err); background:rgba(248,113,113,.08); }
+  .b-warn { color:var(--warn); border-color:var(--warn); background:rgba(251,191,36,.08); }
+  .b-dim { color:var(--dim); border-color:var(--dim); }
+  .row { display:flex; justify-content:space-between; gap:10px; padding:3px 0; font-size:13px; }
+  .row .k { color:var(--dim); flex-shrink:0; }
+  .row .v { text-align:right; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .quota { margin-top:8px; border-top:1px dashed var(--border); padding-top:8px; }
+  .quota .row { font-size:12px; }
+  .delay-ok { color:var(--ok); } .delay-warn { color:var(--warn); } .delay-err { color:var(--err); } .delay-none { color:var(--dim); }
+  .err { color:var(--err); padding:24px; }
+  .btn { margin-top:10px; width:100%; padding:6px 0; font:inherit; font-size:12px; color:var(--accent); background:transparent; border:1px solid var(--accent); border-radius:8px; cursor:pointer; }
+  .btn:hover { background:rgba(79,140,255,.12); }
+  .btn:disabled { opacity:.45; cursor:default; }
+  .btn.testing { color:var(--warn); border-color:var(--warn); }
+  .sec-head { display:flex; align-items:center; justify-content:space-between; margin:28px 0 12px; }
+  .sec-head h2 { margin:0; }
+  .zap { font-size:16px; line-height:1; padding:6px 12px; color:var(--accent); background:transparent; border:1px solid var(--border); border-radius:8px; cursor:pointer; }
+  .zap:hover { border-color:var(--accent); background:rgba(79,140,255,.12); }
+  .zap.busy { color:var(--warn); border-color:var(--warn); animation:pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity:.5; } }
+  html[data-theme="light"] { --bg:#f3f5f9; --card:#ffffff; --border:#dde3ec; --text:#1c2330; --dim:#68717f; --accent:#2f6fe4; }
+  @media (prefers-color-scheme: light) { html[data-theme="system"] { --bg:#f3f5f9; --card:#ffffff; --border:#dde3ec; --text:#1c2330; --dim:#68717f; --accent:#2f6fe4; } }
+  .hrow { display:flex; align-items:center; justify-content:space-between; }
+  .gear { font-size:16px; line-height:1; padding:6px 12px; color:var(--dim); background:transparent; border:1px solid var(--border); border-radius:8px; cursor:pointer; }
+  .gear:hover { color:var(--text); border-color:var(--dim); }
+  .popover { display:none; position:fixed; top:64px; right:24px; width:280px; background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; box-shadow:0 8px 28px rgba(0,0,0,.35); z-index:10; }
+  .popover.open { display:block; }
+  .pop-title { font-size:12px; color:var(--dim); margin:6px 0 8px; text-transform:uppercase; letter-spacing:.08em; }
+  .seg { display:flex; gap:6px; }
+  .seg button { flex:1; padding:6px 0; font:inherit; font-size:12px; color:var(--dim); background:transparent; border:1px solid var(--border); border-radius:8px; cursor:pointer; }
+  .seg button:hover { color:var(--text); }
+  .seg button.active { color:var(--accent); border-color:var(--accent); background:rgba(79,140,255,.10); }
+  .pop-note { font-size:12px; color:var(--dim); margin-top:10px; line-height:1.5; }
+  .log-note { font-size:12px; color:var(--dim); }
+  .logs { background:var(--card); border:1px solid var(--border); border-radius:12px; overflow:hidden; }
+  .logrow { display:grid; grid-template-columns:66px 44px 1fr 150px 70px 34px; gap:8px; padding:7px 14px; font-size:12px; border-bottom:1px solid var(--border); align-items:center; }
+  .logrow:last-child { border-bottom:none; }
+  .logrow .l-time { color:var(--dim); font-variant-numeric:tabular-nums; }
+  .logrow .l-model { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .logrow .l-acct { color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .logrow .l-ms { text-align:right; color:var(--dim); font-variant-numeric:tabular-nums; }
+  .logrow .l-tag { text-align:center; color:var(--dim); font-size:11px; }
+  .l-status { text-align:center; border-radius:6px; font-weight:600; }
+  .l-s2 { color:var(--ok); } .l-s4 { color:var(--warn); } .l-s5 { color:var(--err); }
+  .logs-empty { padding:18px; text-align:center; color:var(--dim); font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="hrow"><h1>freebuff2api admin</h1><div style="display:flex;gap:8px;align-items:center"><button class="gear" id="gearBtn" title="设置">⚙</button><button class="gear" id="logsBtn" title="请求日志">📜</button></div></div>
+  <div class="sub" id="sub">加载中…</div>
+  <div class="summary" id="summary"></div>
+  <div id="warn"></div>
+</header>
+<div class="popover" id="settingsPop">
+  <div class="pop-title">主题</div>
+  <div class="seg" id="themeSeg">
+    <button data-theme-set="light">浅色</button>
+    <button data-theme-set="dark">深色</button>
+    <button data-theme-set="system">系统</button>
+  </div>
+  <div class="pop-title">账号策略</div>
+  <div class="seg" id="stratSeg">
+    <button data-strat="round-robin">轮询</button>
+    <button data-strat="sequential">顺序优先</button>
+  </div>
+  <div class="pop-note">顺序优先：始终用一个号，额度用完自动换下一个；每号同时仅一个会话</div>
+</div>
+<div class="toast" id="toast"></div>
+<div class="sec-head"><h2>出口区域</h2><button class="zap" id="testall" title="全部区域测速">⚡</button></div>
+<div class="cards" id="regions"></div>
+<div class="sec-head"><h2>账号</h2><div style="display:flex;gap:8px"><button class="zap" id="probeall" title="全部账号探测">🔍</button><button class="zap" id="addacct" title="添加账号">＋</button></div></div>
+<div class="card" id="addform" style="display:none;margin-bottom:12px">
+  <div class="head"><div class="title">添加账号</div></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <input id="addemail" placeholder="邮箱（如 xx@qq.com）" style="flex:1;min-width:140px;padding:6px 10px;font:inherit;font-size:13px;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:8px" />
+    <input id="addtoken" placeholder="authToken（freebuff token）" style="flex:1.5;min-width:180px;padding:6px 10px;font:inherit;font-size:13px;color:var(--text);background:var(--bg);border:1px solid var(--border);border-radius:8px" />
+  </div>
+  <button class="btn" id="addsubmit">验证并添加（GET /api/v1/me，不占额度）</button>
+  <button class="btn" id="addoauth">🔑 一键登录加号（打开授权页 → 自动轮询入池）</button>
+  <div id="oauthbox" style="display:none;margin-top:8px;font-size:13px;line-height:1.7;padding:8px 10px;border:1px dashed var(--border);border-radius:8px"></div>
+</div>
+<div class="cards" id="accounts"></div>
+<div class="sec-head"><h2>请求日志</h2><span class="log-note">点击右上角 📜 打开日志页面（可筛选 / 导出 / 清空）</span></div>
+<script>
+var KEY = new URLSearchParams(location.search).get('key') || '';
+// ---- 主题：浅色/深色/系统（localStorage 持久化）----
+var THEME_KEY = 'fb2a-theme';
+function applyTheme(t) {
+  if (t !== 'light' && t !== 'dark' && t !== 'system') t = 'system';
+  document.documentElement.dataset.theme = t;
+  try { localStorage.setItem(THEME_KEY, t); } catch (e) {}
+  var btns = document.querySelectorAll('button[data-theme-set]');
+  btns.forEach(function(b) { b.classList.toggle('active', b.dataset.themeSet === t); });
+}
+applyTheme((function() { try { return localStorage.getItem(THEME_KEY) || 'system'; } catch (e) { return 'system'; } })());
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function ago(ts) {
+  if (!ts) return '从未';
+  var s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return s + ' 秒前';
+  if (s < 3600) return Math.floor(s/60) + ' 分钟前';
+  if (s < 86400) return Math.floor(s/3600) + ' 小时前';
+  return Math.floor(s/86400) + ' 天前';
+}
+function fmtDur(sec) {
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec/60) + 'm' + (sec%60) + 's';
+  return Math.floor(sec/3600) + 'h' + Math.floor((sec%3600)/60) + 'm';
+}
+function api() {
+  return fetch('/admin/api/state' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''))
+    .then(function(r) {
+      if (r.status === 401) { document.getElementById('sub').textContent = 'ADMIN_KEY 无效'; throw new Error('unauthorized'); }
+      return r.json();
+    });
+}
+function badge(state, alive) {
+  var cls = 'b-dim', label = state || 'unknown';
+  if (state === 'ok') cls = 'b-ok';
+  else if (state === 'unknown') cls = 'b-dim';
+  else if (state === 'rate_limited') cls = 'b-warn';
+  else cls = 'b-err';
+  return '<span class="badge ' + cls + '">' + esc(label) + '</span>';
+}
+function delayHtml(d) {
+  if (d == null) return '<span class="delay-none">无数据</span>';
+  var cls = d <= 300 ? 'delay-ok' : (d <= 800 ? 'delay-warn' : 'delay-err');
+  return '<span class="' + cls + '">' + d + ' ms</span>';
+}
+function render(d) {
+  document.getElementById('sub').textContent = 'v' + d.version + ' · ' + d.time;
+  var sm = [
+    '<div class="item"><b>' + d.accounts.length + '</b><span>账号</span></div>',
+    '<div class="item"><b>' + d.stats.totalRequests + '</b><span>请求</span></div>',
+    '<div class="item"><b>' + d.stats.totalErrors + '</b><span>错误</span></div>',
+    '<div class="item"><b>' + fmtDur(d.uptimeSec) + '</b><span>运行时长</span></div>',
+    '<div class="item"><b>' + (d.proxy.enabled ? 'ON' : 'OFF') + '</b><span>代理出口</span></div>'
+  ].join('');
+  document.getElementById('summary').innerHTML = sm;
+  document.getElementById('warn').innerHTML = d.proxy.enabled
+    ? (d.proxy.mihomoApi !== 'ok' ? '<div class="banner">mihomo API 不可达（' + esc(d.proxy.host) + ':9090）—— 区域节点状态可能滞后</div>' : '')
+    : '<div class="banner">代理出口未启用：所有账号共用一个出口 IP，设备画像与 IP 地理不一致，存在关联检测风险</div>';
+  var rg = (d.proxy.regions || []).map(function(r, i) {
+    return '<div class="card" data-region="' + esc(r.code) + '"><div class="head"><div class="title">' + r.flag + ' ' + esc(r.name) + '</div>' + delayHtml(r.delay) + '</div>'
+      + '<div class="row"><span class="k">端口</span><span class="v">:' + r.port + '</span></div>'
+      + '<div class="row"><span class="k">当前节点</span><span class="v" title="' + esc(r.node) + '">' + esc(r.node || '—') + '</span></div>'
+      + '<button class="btn" data-delay="' + esc(r.code) + '">测速</button></div>';
+  }).join('');
+  document.getElementById('regions').innerHTML = rg || '<div class="card"><div class="row"><span class="k">未启用代理</span></div></div>';
+  var ac = (d.accounts || []).map(function(a) {
+    var regionLine = a.region ? (a.region.flag + ' ' + esc(a.region.name) + ' · :' + a.region.port) : '直连';
+    var cd = a.cooldownUntil ? ' · 冷却 ' + fmtDur(Math.ceil((a.cooldownUntil - Date.now())/1000)) : '';
+    var dup = (d.accounts || []).filter(function(x) { return x.email === a.email; }).length > 1;
+    var label = dup ? a.email + ' · ' + a.key : a.email;
+    var quota = (a.quota || []).map(function(q) {
+      var rem = q.remaining != null ? (q.remaining + '/' + q.limit) : '—';
+      return '<div class="row"><span class="k">' + esc(q.model) + '</span><span class="v">' + rem + '</span></div>';
+    }).join('');
+    return '<div class="card">'
+      + '<div class="head"><div class="title" title="' + esc(label) + '">' + esc(label) + '</div>' + badge(a.state, a.alive) + '</div>'
+      + '<div class="row"><span class="k">出口区域</span><span class="v">' + regionLine + '</span></div>'
+      + '<div class="row"><span class="k">设备画像</span><span class="v">' + esc(a.device.os) + ' · ' + esc(a.device.timezone) + ' · ' + esc(a.device.locale) + '</span></div>'
+      + '<div class="row"><span class="k">活跃会话</span><span class="v">' + a.activeSessions + '</span></div>'
+      + '<div class="row"><span class="k">请求 / 错误</span><span class="v">' + a.requests + ' / ' + a.errors + cd + '</span></div>'
+      + '<div class="row"><span class="k">最后使用</span><span class="v">' + ago(a.lastUsedAt) + '</span></div>'
+      + (quota ? '<div class="quota">' + quota + '</div>' : '')
+      + '<div style="display:flex;gap:8px;margin-top:10px">'
+      + '<button class="btn" style="margin-top:0" data-probe="' + esc(a.key) + '">探测</button>'
+      + '<button class="btn" style="margin-top:0;color:var(--err);border-color:var(--err)" data-del="' + esc(a.key) + '">删除</button>'
+      + '</div>'
+      + '</div>';
+  }).join('');
+  document.getElementById('accounts').innerHTML = ac;
+  // 请求日志已移到独立页面 /admin/logs（本页面不再渲染日志明细）
+  var strat = d.settings && d.settings.accountStrategy;
+  var sbtns = document.querySelectorAll('button[data-strat]');
+  sbtns.forEach(function(b) { b.classList.toggle('active', b.dataset.strat === strat); });
+}
+function tick() { api().then(render).catch(function(){}); }
+tick();
+setInterval(tick, 5000);
+
+// 手动测速：单区域或全部（__all__）。测完后刷新一次面板（延迟数据来自
+// mihomo provider health-check 历史，group/delay 会同时写入）。
+var testing = false;
+var toastTimer = null;
+function toast(msg, kind) {
+  var t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.className = 'toast show toast-' + (kind || 'ok');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function() { t.className = 'toast'; }, 4000);
+}
+function setZap(text, busy) {
+  var z = document.getElementById('testall');
+  if (!z) return;
+  z.textContent = text || '⚡';
+  z.classList.toggle('busy', !!busy);
+}
+function runDelay(code) {
+  if (testing) return;
+  testing = true;
+  var zapMode = code === '__all__';
+  var label = zapMode ? '全部区域' : code;
+  var btns = document.querySelectorAll('button[data-delay]');
+  btns.forEach(function(b) { b.disabled = true; if (!zapMode && b.dataset.delay === code) b.classList.add('testing'); });
+  if (zapMode) setZap('…', true);
+  fetch('/admin/api/delay' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(zapMode ? {} : { region: code })
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var parts = [];
+      var fails = 0;
+      Object.keys(d.results || {}).forEach(function(k) {
+        var v = d.results[k];
+        if (v.ok) parts.push(k + ' ' + (v.nodes > 1 ? v.min + '-' + v.max : (v.min != null ? v.min : '?')) + 'ms');
+        else { fails++; parts.push(k + ' 失败'); }
+      });
+      toast(label + '测速' + (fails ? '：' + (d.results ? Object.keys(d.results).length - fails : 0) + '/' + Object.keys(d.results || {}).length + ' 成功' : '完成') + ' · ' + parts.join('，'), fails ? (Object.keys(d.results || {}).length === fails ? 'err' : 'warn') : 'ok');
+    })
+    .catch(function(e) { toast(label + '测速请求失败：' + String(e), 'err'); })
+    .finally(function() {
+      testing = false;
+      if (zapMode) setZap('⚡', false);
+      btns.forEach(function(b) { b.disabled = false; b.classList.remove('testing'); });
+      tick();
+    });
+}
+document.addEventListener('click', function(ev) {
+  var t = ev.target.closest ? ev.target.closest('button[data-delay]') : null;
+  if (t && !testing) { runDelay(t.dataset.delay); return; }
+  var z = ev.target.closest ? ev.target.closest('#testall') : null;
+  if (z && !testing) { runDelay('__all__'); return; }
+});
+
+// ---- 账号管理：添加 / 探测 / 删除 ----
+function adminUrl(path) { return path + (KEY ? '?key=' + encodeURIComponent(KEY) : ''); }
+var probing = false;
+function runProbe(key) {
+  if (probing) return;
+  probing = true;
+  toast((key ? '「' + key + '…」' : '全部账号') + '探测中…', 'warn');
+  fetch(adminUrl('/admin/api/probe'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(key ? { token: key } : {})
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      var parts = (d.results || []).map(function(x) {
+        return (x.email || '?').split('@')[0].slice(0, 12) + ' ' + (x.state || '?') + (x.status ? '(HTTP ' + x.status + ')' : '');
+      });
+      var fails = (d.results || []).filter(function(x) { return x.alive !== true; }).length;
+      toast('探测完成：' + (d.results ? d.results.length - fails : 0) + '/' + (d.results || []).length + ' 存活 · ' + parts.join('，'), fails ? 'warn' : 'ok');
+    })
+    .catch(function(e) { toast('探测请求失败：' + String(e), 'err'); })
+    .finally(function() { probing = false; tick(); });
+}
+function runDelete(key) {
+  if (!key || !confirm('确定删除账号「' + key + '…」？将同时移除 credentials 文件并从账号池移除。')) return;
+  fetch(adminUrl('/admin/api/accounts'), {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token: key })
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) toast('已删除「' + d.removed + '」，剩余 ' + d.accounts + ' 个账号', 'ok');
+      else toast('删除失败：' + esc(d.error && d.error.message), 'err');
+    })
+    .catch(function(e) { toast('删除请求失败：' + String(e), 'err'); })
+    .finally(function() { tick(); });
+}
+var addform = document.getElementById('addform');
+var addacct = document.getElementById('addacct');
+if (addacct) addacct.addEventListener('click', function() {
+  addform.style.display = addform.style.display === 'none' ? 'block' : 'none';
+  if (addform.style.display === 'block') document.getElementById('addemail').focus();
+});
+var addsubmit = document.getElementById('addsubmit');
+if (addsubmit) addsubmit.addEventListener('click', function() {
+  var email = document.getElementById('addemail').value.trim();
+  var token = document.getElementById('addtoken').value.trim();
+  if (!email || !token) { toast('邮箱和 token 都要填', 'err'); return; }
+  addsubmit.disabled = true;
+  addsubmit.textContent = '验证中…（经上游 /api/v1/me 校验）';
+  fetch(adminUrl('/admin/api/accounts'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: email, authToken: token })
+  })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) {
+        toast('已添加「' + d.email + '」（' + d.state + '），共 ' + d.accounts + ' 个账号', 'ok');
+        document.getElementById('addemail').value = '';
+        document.getElementById('addtoken').value = '';
+        addform.style.display = 'none';
+      } else {
+        toast('添加失败：' + esc(d.error && d.error.message), 'err');
+      }
+    })
+    .catch(function(e) { toast('添加请求失败：' + String(e), 'err'); })
+    .finally(function() {
+      addsubmit.disabled = false;
+      addsubmit.textContent = '验证并添加（GET /api/v1/me，不占额度）';
+      tick();
+    });
+});
+// ---- 一键登录加号（服务端授权码轮询，见 /admin/api/accounts/login）----
+var logsBtn = document.getElementById('logsBtn');
+if (logsBtn) logsBtn.addEventListener('click', function() {
+  location.href = '/admin/logs' + (KEY ? '?key=' + encodeURIComponent(KEY) : '');
+});
+function loginPollUrl(id) {
+  return '/admin/api/accounts/login?id=' + encodeURIComponent(id) + (KEY ? '&key=' + encodeURIComponent(KEY) : '');
+}
+var addoauth = document.getElementById('addoauth');
+var oauthbox = document.getElementById('oauthbox');
+var oauthTimer = null;
+function oauthStop() { if (oauthTimer) { clearInterval(oauthTimer); oauthTimer = null; } }
+if (addoauth) addoauth.addEventListener('click', function() {
+  addoauth.disabled = true;
+  oauthStop();
+  oauthbox.style.display = 'none';
+  oauthbox.innerHTML = '';
+  fetch(adminUrl('/admin/api/accounts/login'), { method: 'POST' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (!d.ok || !d.id) {
+        toast('发起授权失败：' + esc(d.error && d.error.message), 'err');
+        addoauth.disabled = false;
+        return;
+      }
+      var startAt = Date.now();
+      var deadline = startAt + 5.5 * 60 * 1000;
+      var pollFails = 0;
+      oauthbox.style.display = 'block';
+      oauthbox.innerHTML = '<a href="' + esc(d.loginUrl) + '" target="_blank" rel="noopener" style="text-decoration:underline">① 点这里打开官方授权页</a>'
+        + '<div id="oauthstate">② 已在新窗口等待授权…（完成后本页自动入池）</div>'
+        + '<div style="font-size:12px;color:var(--dim)">浏览器打开授权页需能访问 codebuff（配合你自己的代理）；服务端只负责轮询取 token。</div>';
+      oauthTimer = setInterval(function() {
+        if (Date.now() > deadline) {
+          oauthStop();
+          oauthbox.innerHTML = '⏰ 授权超时，请重新点击「一键登录加号」';
+          addoauth.disabled = false;
+          return;
+        }
+        fetch(loginPollUrl(d.id))
+          .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(function(p) {
+            pollFails = 0;
+            if (!p.done) {
+              var s = document.getElementById('oauthstate');
+              if (s) s.textContent = '② 等待授权中…（已等 ' + Math.round((Date.now() - startAt) / 1000) + 's）';
+              return;
+            }
+            oauthStop();
+            addoauth.disabled = false;
+            if (p.ok && p.manual) {
+              document.getElementById('addemail').value = p.email || '';
+              document.getElementById('addtoken').value = p.authToken || '';
+              oauthbox.innerHTML = '✅ 授权成功（' + esc(p.email) + '），token 已回填表单——当前运行环境不支持自动写盘，请点上方「验证并添加」完成入池';
+            } else if (p.ok) {
+              toast(p.exists ? ('「' + esc(p.email) + '」已在账号池中') : ('已添加「' + esc(p.email) + '」，共 ' + p.accounts + ' 个账号'), p.exists ? 'warn' : 'ok');
+              oauthbox.style.display = 'none';
+              addform.style.display = 'none';
+            } else {
+              oauthbox.innerHTML = '❌ ' + esc(p.error || '授权失败');
+            }
+            tick();
+          })
+          .catch(function(e) {
+            // 轮询请求本身失败（网络/接口异常）：连续 3 次则停下并提示，不再静默卡死
+            pollFails++;
+            var s = document.getElementById('oauthstate');
+            if (pollFails >= 3) {
+              oauthStop();
+              oauthbox.innerHTML = '❌ 轮询失败（' + esc(String(e && e.message || e)) + '），请刷新页面重试';
+              addoauth.disabled = false;
+            } else if (s) {
+              s.textContent = '② 轮询出错(' + pollFails + '/3)：' + String(e && e.message || e) + '，继续重试…';
+            }
+          });
+      }, 3000);
+    })
+    .catch(function(e) {
+      toast('发起授权失败：' + String(e), 'err');
+      addoauth.disabled = false;
+    });
+});
+document.addEventListener('click', function(ev) {
+  var p = ev.target.closest ? ev.target.closest('button[data-probe]') : null;
+  if (p) { runProbe(p.dataset.probe); return; }
+  var pa = ev.target.closest ? ev.target.closest('#probeall') : null;
+  if (pa) { runProbe(null); return; }
+  var dl = ev.target.closest ? ev.target.closest('button[data-del]') : null;
+  if (dl) { runDelete(dl.dataset.del); return; }
+});
+
+// ---- 设置弹层 ----
+var gear = document.getElementById('gearBtn');
+var pop = document.getElementById('settingsPop');
+if (gear) gear.addEventListener('click', function(ev) {
+  ev.stopPropagation();
+  pop.classList.toggle('open');
+});
+document.addEventListener('click', function(ev) {
+  if (pop && pop.classList.contains('open') && !pop.contains(ev.target)) pop.classList.remove('open');
+});
+document.querySelectorAll('button[data-theme-set]').forEach(function(b) {
+  b.addEventListener('click', function() { applyTheme(b.dataset.themeSet); });
+});
+document.querySelectorAll('button[data-strat]').forEach(function(b) {
+  b.addEventListener('click', function() {
+    fetch('/admin/api/settings' + (KEY ? '?key=' + encodeURIComponent(KEY) : ''), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accountStrategy: b.dataset.strat })
+    })
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        if (d.ok) toast('账号策略已切换：' + (d.settings.accountStrategy === 'sequential' ? '顺序优先' : '轮询'), 'ok');
+        else toast('设置失败：' + esc(d.error && d.error.message), 'err');
+      })
+      .catch(function(e) { toast('设置请求失败：' + esc(String(e)), 'err'); });
+  });
+});
+</script>
+</body>
+</html>`;
+
+// 日志独立界面 HTML（/admin/logs）：单文件零依赖，与 /admin 同主题体系。
+// 功能：全量日志表格 + 关键字筛选 + 自动刷新 + 导出 JSON + 清空日志。
+const LOGS_HTML = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>freebuff2api · 请求日志</title>
+<style>
+  :root { --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3; --dim:#8b949e; --ok:#3fb950; --warn:#d29922; --err:#f85149; --acc:#58a6ff; }
+  :root[data-theme="light"] { --bg:#f6f8fa; --card:#fff; --border:#d0d7de; --text:#1f2328; --dim:#656d76; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --acc:#0969da; }
+  @media (prefers-color-scheme: light) { :root:not([data-theme]) { --bg:#f6f8fa; --card:#fff; --border:#d0d7de; --text:#1f2328; --dim:#656d76; --ok:#1a7f37; --warn:#9a6700; --err:#cf222e; --acc:#0969da; } }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:18px; background:var(--bg); color:var(--text); font:14px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; }
+  a { color:var(--acc); text-decoration:none; }
+  .head { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+  h1 { font-size:17px; margin:0; }
+  .sub { color:var(--dim); font-size:12px; }
+  .bar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:12px; }
+  input[type=text] { flex:1; min-width:160px; padding:6px 10px; font:inherit; font-size:13px; color:var(--text); background:var(--card); border:1px solid var(--border); border-radius:8px; }
+  button { padding:6px 12px; font:inherit; font-size:13px; color:var(--text); background:var(--card); border:1px solid var(--border); border-radius:8px; cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.danger { color:var(--err); border-color:var(--err); }
+  button:disabled { opacity:.5; cursor:default; }
+  label.chk { font-size:12px; color:var(--dim); display:flex; align-items:center; gap:4px; }
+  .table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+  .table th, .table td { padding:6px 10px; text-align:left; font-size:12.5px; border-bottom:1px solid var(--border); white-space:nowrap; }
+  .table th { color:var(--dim); font-weight:600; background:var(--bg); position:sticky; top:0; }
+  .table tr:hover td { background:rgba(127,127,127,.06); }
+  .s2 { color:var(--ok); font-weight:600; } .s4 { color:var(--warn); font-weight:600; } .s5 { color:var(--err); font-weight:600; }
+  .err { color:var(--err); }
+  .dim { color:var(--dim); }
+  .empty { padding:24px; text-align:center; color:var(--dim); }
+  .toast { position:fixed; right:16px; bottom:16px; padding:10px 14px; border-radius:10px; background:var(--card); border:1px solid var(--border); font-size:13px; opacity:0; transition:opacity .2s; pointer-events:none; max-width:70vw; }
+  .toast.show { opacity:1; }
+  .toast-err { border-color:var(--err); color:var(--err); }
+  .toast-ok { border-color:var(--ok); }
+  .tag { font-size:11px; border:1px solid var(--border); border-radius:6px; padding:0 5px; color:var(--dim); }
+</style>
+</head>
+<body>
+<div class="head">
+  <h1>请求日志</h1>
+  <a href="/admin" id="backLink">← 返回面板</a>
+  <span class="sub" id="sub">加载中…</span>
+</div>
+<div class="bar">
+  <input type="text" id="filter" placeholder="筛选：账号 / 模型 / 状态 / 错误关键字" />
+  <label class="chk"><input type="checkbox" id="auto" checked> 自动刷新(3s)</label>
+  <button id="refreshBtn">刷新</button>
+  <button id="exportBtn">导出 JSON</button>
+  <button id="clearBtn" class="danger">清空日志</button>
+</div>
+<div id="wrap"><div class="empty">加载中…</div></div>
+<div class="toast" id="toast"></div>
+<script>
+var KEY = new URLSearchParams(location.search).get('key') || '';
+if (KEY) document.getElementById('backLink').href = '/admin?key=' + encodeURIComponent(KEY);
+try { var t = localStorage.getItem('fb2a-theme'); if (t) document.documentElement.dataset.theme = t; } catch (e) {}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
+function logsUrl(path) { return path + (KEY ? '?key=' + encodeURIComponent(KEY) : ''); }
+var toastTimer = null;
+function toast(msg, kind) {
+  var el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show toast-' + (kind || 'ok');
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function() { el.className = 'toast'; }, 4000);
+}
+var lastLogs = [];
+function fmtTs(ts) {
+  if (ts == null) return '—';
+  var d = typeof ts === 'number' ? new Date(ts) : new Date(ts);
+  if (isNaN(d.getTime())) return String(ts);
+  var p = function(n) { return ('0' + n).slice(-2); };
+  return p(d.getMonth()+1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+function fmtMs(ms) { return ms == null ? '—' : (ms < 1000 ? ms + 'ms' : (ms/1000).toFixed(1) + 's'); }
+function statusClass(s) { return s >= 500 ? 's5' : (s >= 400 ? 's4' : 's2'); }
+function renderLogs() {
+  var kw = document.getElementById('filter').value.trim().toLowerCase();
+  var rows = lastLogs.filter(function(l) {
+    if (!kw) return true;
+    return (String(l.account||'') + ' ' + String(l.model||'') + ' ' + String(l.status||'') + ' ' + String(l.err||'')).toLowerCase().indexOf(kw) >= 0;
+  });
+  document.getElementById('sub').textContent = '共 ' + lastLogs.length + ' 条（内存上限 200，重启清空）· 显示 ' + rows.length + ' 条';
+  if (!rows.length) { document.getElementById('wrap').innerHTML = '<div class="empty">暂无匹配日志</div>'; return; }
+  var html = '<table class="table"><tr><th>时间</th><th>状态</th><th>模型</th><th>账号</th><th>耗时</th><th>类型</th><th>错误</th></tr>';
+  for (var i = 0; i < rows.length; i++) {
+    var l = rows[i];
+    html += '<tr>'
+      + '<td class="dim">' + fmtTs(l.ts) + '</td>'
+      + '<td class="' + statusClass(l.status) + '">' + esc(l.status) + '</td>'
+      + '<td>' + esc(l.model) + '</td>'
+      + '<td>' + esc(l.account) + '</td>'
+      + '<td>' + fmtMs(l.ms) + '</td>'
+      + '<td>' + (l.stream ? '<span class="tag">流式</span>' : '<span class="tag dim">—</span>') + '</td>'
+      + '<td class="err" title="' + esc(l.err) + '">' + esc(l.err ? String(l.err).slice(0, 120) : '') + '</td>'
+      + '</tr>';
+  }
+  html += '</table>';
+  document.getElementById('wrap').innerHTML = html;
+}
+function tick() {
+  fetch(logsUrl('/admin/api/logs'))
+    .then(function(r) {
+      if (r.status === 401) { document.getElementById('sub').textContent = 'ADMIN_KEY 无效'; throw new Error('unauthorized'); }
+      return r.json();
+    })
+    .then(function(d) { lastLogs = d.logs || []; renderLogs(); })
+    .catch(function() {});
+}
+document.getElementById('refreshBtn').addEventListener('click', tick);
+document.getElementById('filter').addEventListener('input', renderLogs);
+document.getElementById('auto').addEventListener('change', function() { restartTimer(); });
+var timer = null;
+function restartTimer() {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (document.getElementById('auto').checked) timer = setInterval(tick, 3000);
+}
+document.getElementById('exportBtn').addEventListener('click', function() {
+  if (!lastLogs.length) { toast('没有日志可导出', 'err'); return; }
+  var blob = new Blob([JSON.stringify(lastLogs, null, 2)], { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'freebuff2api-logs-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.json';
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('已导出 ' + lastLogs.length + ' 条', 'ok');
+});
+document.getElementById('clearBtn').addEventListener('click', function() {
+  if (!confirm('确定清空全部日志？（仅内存日志，不可恢复）')) return;
+  fetch(logsUrl('/admin/api/logs'), { method: 'DELETE' })
+    .then(function(r) { return r.json(); })
+    .then(function(d) {
+      if (d.ok) { toast('已清空 ' + d.cleared + ' 条日志', 'ok'); tick(); }
+      else toast('清空失败：' + esc(d.error && d.error.message), 'err');
+    })
+    .catch(function(e) { toast('清空请求失败：' + String(e), 'err'); });
+});
+tick();
+restartTimer();
+</script>
+</body>
+</html>`;
